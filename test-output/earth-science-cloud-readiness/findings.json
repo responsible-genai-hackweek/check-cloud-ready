@@ -1,0 +1,704 @@
+{
+  "skill": "earth-science-cloud-readiness",
+  "generated": "2026-08-26T22:47:24.555207+00:00",
+  "input": {
+    "raw": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_PROVISIONAL_V1/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5",
+    "type": "asset",
+    "profile_hint": null
+  },
+  "sample_frame": {
+    "strategy": "single asset",
+    "selection_rule": "as given"
+  },
+  "environment": {
+    "network": true,
+    "libraries": {
+      "rasterio": true,
+      "rio_cogeo": true,
+      "zarr": true,
+      "xarray": true,
+      "h5py": true,
+      "fsspec": true,
+      "s3fs": true,
+      "pyarrow": true,
+      "pystac": true,
+      "pystac_client": true,
+      "httpx": true
+    }
+  },
+  "notes": [],
+  "assets": [
+    {
+      "id": "NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5",
+      "url": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_PROVISIONAL_V1/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5",
+      "collection": null,
+      "media_type": null,
+      "format_hint": null,
+      "roles": [],
+      "item_datetime": null,
+      "format": "hdf5",
+      "checks": [
+        {
+          "id": "A-class",
+          "dimension": "A",
+          "points_possible": 30,
+          "points_awarded": 10,
+          "status": "partial",
+          "evidence": "format=hdf5, class=cloud-optimizable; chunks < 1 MB in: ['science/LSAR/GCOV/grids/frequencyA/inputDataExceptionMask', 'science/LSAR/GCOV/grids/frequencyA/mask', 'science/LSAR/GCOV/grids/frequencyB/inputDataExceptionMask', 'science/LSAR/GCOV/grids/frequencyB/mask'] (classic failure); no paged aggregation detected",
+          "remediation": "h5repack -l /var:CHUNK=1x512x512 in.h5 out.h5"
+        },
+        {
+          "id": "B1-open",
+          "dimension": "B",
+          "points_possible": 8,
+          "points_awarded": 8,
+          "status": "pass",
+          "evidence": "requests_to_open=1, bytes_to_open=0",
+          "remediation": null
+        },
+        {
+          "id": "B2-crs",
+          "dimension": "B",
+          "points_possible": 3,
+          "points_awarded": 0,
+          "status": "fail",
+          "evidence": "no machine-readable CRS found",
+          "remediation": "embed CRS in-file and add STAC proj: extension"
+        },
+        {
+          "id": "B3-semantics",
+          "dimension": "B",
+          "points_possible": 5,
+          "points_awarded": 1,
+          "status": "fail",
+          "evidence": "units/nodata/CF not confirmed",
+          "remediation": "declare CF attrs, units, nodata/_FillValue, scale/offset"
+        },
+        {
+          "id": "B4-catalog",
+          "dimension": "B",
+          "points_possible": 4,
+          "points_awarded": 0,
+          "status": "n/a",
+          "evidence": "no catalog in input",
+          "remediation": null
+        },
+        {
+          "id": "C1-interactive",
+          "dimension": "C",
+          "points_possible": 5,
+          "points_awarded": 2.0,
+          "status": "partial",
+          "evidence": "estimated compressed chunk \u2248 0.52 MB",
+          "remediation": "target ~1-4 MB tiles/chunks + overviews"
+        },
+        {
+          "id": "C2-training",
+          "dimension": "C",
+          "points_possible": 7,
+          "points_awarded": 0,
+          "status": "fail",
+          "evidence": "estimated compressed chunk \u2248 0.52 MB",
+          "remediation": "rechunk to 32-64 MB chunks/shards aligned with sampling pattern (rechunker recipe in references/zarr.md)"
+        },
+        {
+          "id": "C3-agentic",
+          "dimension": "C",
+          "points_possible": 7,
+          "points_awarded": 7,
+          "status": "pass",
+          "evidence": "catalog\u2192variables\u2192one subset \u2248 2 requests; estimated compressed chunk \u2248 0.52 MB",
+          "remediation": null
+        },
+        {
+          "id": "C4-count",
+          "dimension": "C",
+          "points_possible": 3,
+          "points_awarded": 3,
+          "status": "pass",
+          "evidence": "estimated total chunks \u2248 33249",
+          "remediation": null
+        },
+        {
+          "id": "C5-codec",
+          "dimension": "C",
+          "points_possible": 3,
+          "points_awarded": 1,
+          "status": "fail",
+          "evidence": "no compression observed; measured on one sampled chunk: best zstd-3+shuffle ratio 20971.52x, decode 17143.1 MB/s (10 grid cells trialed)",
+          "remediation": "data is compressible: apply zstd level 3 + shuffle (measured 20971.52x on sampled chunk)"
+        },
+        {
+          "id": "D1-range",
+          "dimension": "D",
+          "points_possible": 6,
+          "points_awarded": 6,
+          "status": "pass",
+          "evidence": "[{\"range\": \"0-16383\", \"http_status\": 206, \"bytes\": 16384, \"expected\": 16384, \"ok\": true, \"latency_ms\": 560.1}, {\"range\": \"1755316224-1755332607\", \"http_status\": 206, \"bytes\": 16384, \"expected\": 16384, \"ok\": true, \"latency_ms\": 505.5}]",
+          "remediation": null
+        },
+        {
+          "id": "D2-auth",
+          "dimension": "D",
+          "points_possible": 3,
+          "points_awarded": 3,
+          "status": "pass",
+          "evidence": "HTTP 200",
+          "remediation": null
+        },
+        {
+          "id": "D3-https-cors",
+          "dimension": "D",
+          "points_possible": 3,
+          "points_awarded": 2,
+          "status": "partial",
+          "evidence": "tls=True, CORS Allow-Origin=None",
+          "remediation": "serve over HTTPS; add CORS headers if browser use is plausible"
+        },
+        {
+          "id": "D4-cleanpath",
+          "dimension": "D",
+          "points_possible": 3,
+          "points_awarded": 3,
+          "status": "pass",
+          "evidence": "redirects=1, content_type=binary/octet-stream",
+          "remediation": null
+        },
+        {
+          "id": "E1-version",
+          "dimension": "E",
+          "points_possible": 2,
+          "points_awarded": 1,
+          "status": "partial",
+          "evidence": "etag=\"bfc3d4b0f8c6237d59cce9e7b4086269-14\", icechunk=False",
+          "remediation": null
+        },
+        {
+          "id": "E2-checksums",
+          "dimension": "E",
+          "points_possible": 2,
+          "points_awarded": 1,
+          "status": "partial",
+          "evidence": "sha256=none, strong_etag=True",
+          "remediation": null
+        },
+        {
+          "id": "E3-license",
+          "dimension": "E",
+          "points_possible": 2,
+          "points_awarded": 0,
+          "status": "fail",
+          "evidence": "license=None",
+          "remediation": "add a machine-readable license"
+        },
+        {
+          "id": "E4-citation",
+          "dimension": "E",
+          "points_possible": 1,
+          "points_awarded": 0.5,
+          "status": "skipped",
+          "evidence": "DOI/citation not verifiable from asset alone",
+          "remediation": "add DOI/citation to catalog"
+        },
+        {
+          "id": "E5-contact",
+          "dimension": "E",
+          "points_possible": 1,
+          "points_awarded": 0.5,
+          "status": "skipped",
+          "evidence": "contact not verifiable from asset alone",
+          "remediation": "add maintainer contact to catalog"
+        },
+        {
+          "id": "E6-usage",
+          "dimension": "E",
+          "points_possible": 1,
+          "points_awarded": 0.5,
+          "status": "skipped",
+          "evidence": "no catalog in input; an agent would have to research or guess how to access this data",
+          "remediation": "publish a catalog entry linking runnable example code / tutorial notebooks"
+        },
+        {
+          "id": "E7-applications",
+          "dimension": "E",
+          "points_possible": 1,
+          "points_awarded": 0.5,
+          "status": "skipped",
+          "evidence": "no catalog in input; use cases not discoverable",
+          "remediation": "describe common applications in catalog metadata"
+        }
+      ],
+      "dimensions": {
+        "A": {
+          "score": 10.0,
+          "max": 30
+        },
+        "B": {
+          "score": 11.2,
+          "max": 20
+        },
+        "C": {
+          "score": 13.0,
+          "max": 25
+        },
+        "D": {
+          "score": 14.0,
+          "max": 15
+        },
+        "E": {
+          "score": 4.0,
+          "max": 10
+        }
+      },
+      "score": 52.2,
+      "tier": "D",
+      "tier_label": "Cloud-Hosted only",
+      "score_capped_by_smoke_fail": false,
+      "smoke_test": {
+        "url": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_PROVISIONAL_V1/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5",
+        "format": "hdf5",
+        "caps": {
+          "bytes": 26214400,
+          "seconds": 60.0
+        },
+        "head": {
+          "check": "HEAD",
+          "url": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/NISAR_L2_GCOV_PROVISIONAL_V1/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5",
+          "status": "pass",
+          "http_status": 200,
+          "content_length": "3510632448",
+          "accept_ranges": "bytes",
+          "etag": "\"bfc3d4b0f8c6237d59cce9e7b4086269-14\"",
+          "content_type": "binary/octet-stream",
+          "cors_allow_origin": null,
+          "redirects": 1,
+          "final_url": "https://d1mv8zhcvry6x4.cloudfront.net/head-7fdfbcb0ce308dc58d08f97acb1f0590/sds-n-cumulus-prod-nisar-products.s3.us-west-2.amazonaws.com/NISAR_L2_GCOV_PROVISIONAL_V1/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001/NISAR_L2_PR_GCOV_028_143_D_070_4005_DHDH_A_20260823T030458_20260823T030521_P05023_N_P_J_001.h5?A-userid=aimeeb&Expires=1787787979&Signature=H1Ao5LfYvskxlSJL8i4IlGAABnuV8jX9kSLMIzGXorBHObM1xMUMpKY8ODkUufwMh9dVmq06xSGZtSybXh148vecNgCaw6oUmqicgtKZkPH8rQSxfghKZEb2kb-1dLW5V2VeSSLoOZwl1TgrLJqUZxpmYCqBMaQ1s~nYZmhwrgMkRKkLDis-s3K5ZyzfI8rKN~wlkC40lqMffNSjnF80zgU3GGCWDajpIHXhZNawg3sx8JEGGIydpPuEhGHHvamTZe-pbj7832fefTAY3ArkVsiKukCYTVPgnyWB5GcWnO4Ll97tAlk9d04m05b~XgXEe~eNxrAs4~tqLDvD8Gbi7Q__&Key-Pair-Id=KLNJ6G12341PS",
+          "tls_ok": true,
+          "latency_ms": 710.6
+        },
+        "ranged": {
+          "check": "ranged_reads",
+          "reads": [
+            {
+              "range": "0-16383",
+              "http_status": 206,
+              "bytes": 16384,
+              "expected": 16384,
+              "ok": true,
+              "latency_ms": 560.1
+            },
+            {
+              "range": "1755316224-1755332607",
+              "http_status": 206,
+              "bytes": 16384,
+              "expected": 16384,
+              "ok": true,
+              "latency_ms": 505.5
+            }
+          ],
+          "status": "pass",
+          "first_bytes_hex": "894844460d0a1a0a0208080000000000"
+        },
+        "lazy_open": {
+          "status": "pass",
+          "time_to_open_s": 1.419,
+          "requests_to_open": 1,
+          "bytes_to_open": 0,
+          "datasets": {
+            "science/LSAR/GCOV/grids/frequencyA/HHHH": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/HVHV": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/inputDataExceptionMask": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "uint8",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 262144,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/listOfCovarianceTerms": {
+              "shape": [
+                2
+              ],
+              "dtype": "|S4",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/listOfPolarizations": {
+              "shape": [
+                2
+              ],
+              "dtype": "|S2",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/mask": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "uint8",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 262144,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/numberOfLooks": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/numberOfSubSwaths": {
+              "shape": [],
+              "dtype": "uint8",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/projection": {
+              "shape": [],
+              "dtype": "uint32",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/rtcGammaToSigmaFactor": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/xCoordinateSpacing": {
+              "shape": [],
+              "dtype": "float64",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/xCoordinates": {
+              "shape": [
+                35280
+              ],
+              "dtype": "float64",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/yCoordinateSpacing": {
+              "shape": [],
+              "dtype": "float64",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyA/yCoordinates": {
+              "shape": [
+                34776
+              ],
+              "dtype": "float64",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/HHHH": {
+              "shape": [
+                4347,
+                4410
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/HVHV": {
+              "shape": [
+                4347,
+                4410
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/inputDataExceptionMask": {
+              "shape": [
+                34776,
+                35280
+              ],
+              "dtype": "uint8",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 262144,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/listOfCovarianceTerms": {
+              "shape": [
+                2
+              ],
+              "dtype": "|S4",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/listOfPolarizations": {
+              "shape": [
+                2
+              ],
+              "dtype": "|S2",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/mask": {
+              "shape": [
+                4347,
+                4410
+              ],
+              "dtype": "uint8",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 262144,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/numberOfLooks": {
+              "shape": [
+                4347,
+                4410
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/numberOfSubSwaths": {
+              "shape": [],
+              "dtype": "uint8",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/projection": {
+              "shape": [],
+              "dtype": "uint32",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/rtcGammaToSigmaFactor": {
+              "shape": [
+                4347,
+                4410
+              ],
+              "dtype": "float32",
+              "chunks": [
+                512,
+                512
+              ],
+              "chunk_bytes_uncompressed": 1048576,
+              "compression": "gzip",
+              "layout": "chunked"
+            },
+            "science/LSAR/GCOV/grids/frequencyB/xCoordinateSpacing": {
+              "shape": [],
+              "dtype": "float64",
+              "chunks": null,
+              "chunk_bytes_uncompressed": null,
+              "compression": null,
+              "layout": "contiguous"
+            }
+          },
+          "file_space": {
+            "strategy": "(1, 0, 1)",
+            "page_size": 4194304
+          }
+        },
+        "subset_read": {
+          "status": "pass",
+          "what": "one chunk of science/LSAR/GCOV/grids/frequencyA/HHHH",
+          "ttfb_s_approx": 0.897,
+          "bytes_decoded": 1048576,
+          "throughput_MBps": 1.17
+        },
+        "compression_trials": [
+          {
+            "codec": "zstd-3+shuffle",
+            "ratio": 20971.52,
+            "compress_MBps": 5608.6,
+            "decompress_MBps": 17143.1
+          },
+          {
+            "codec": "zstd-5+shuffle",
+            "ratio": 20971.52,
+            "compress_MBps": 3466.4,
+            "decompress_MBps": 17248.9
+          },
+          {
+            "codec": "zstd-1+shuffle",
+            "ratio": 20560.31,
+            "compress_MBps": 6241.5,
+            "decompress_MBps": 16320.2
+          },
+          {
+            "codec": "zstd-3",
+            "ratio": 9709.04,
+            "compress_MBps": 2155.9,
+            "decompress_MBps": 2945.8
+          },
+          {
+            "codec": "zstd-5",
+            "ratio": 9709.04,
+            "compress_MBps": 1002.5,
+            "decompress_MBps": 1347.1
+          },
+          {
+            "codec": "zstd-1",
+            "ratio": 9619.96,
+            "compress_MBps": 809.4,
+            "decompress_MBps": 1521.7
+          },
+          {
+            "codec": "blosc-zstd-3+shuffle",
+            "ratio": 4096.0,
+            "compress_MBps": 6875.9,
+            "decompress_MBps": 2701.6
+          },
+          {
+            "codec": "blosc-zstd-3",
+            "ratio": 3855.06,
+            "compress_MBps": 513.4,
+            "decompress_MBps": 1902.5
+          },
+          {
+            "codec": "blosc-lz4+shuffle",
+            "ratio": 245.45,
+            "compress_MBps": 18104.8,
+            "decompress_MBps": 6516.3
+          },
+          {
+            "codec": "blosc-lz4",
+            "ratio": 240.5,
+            "compress_MBps": 30.2,
+            "decompress_MBps": 928.2
+          }
+        ],
+        "format_validation": {
+          "tool": "h5py-introspection",
+          "note": "h5stat-style chunk/page inspection",
+          "file_space": {
+            "strategy": "(1, 0, 1)",
+            "page_size": 4194304
+          }
+        },
+        "status": "pass",
+        "budget": {
+          "bytes": 32768,
+          "requests": 4,
+          "elapsed_s": 65.134
+        }
+      }
+    }
+  ],
+  "rollup": {
+    "by_media_type": {
+      "hdf5": {
+        "count": 1,
+        "median_score": 52.2,
+        "tier": "D"
+      }
+    },
+    "dominant_format": "hdf5",
+    "dataset_score": 52.2,
+    "dataset_tier": "D",
+    "dataset_tier_label": "Cloud-Hosted only",
+    "confidence": "high",
+    "smoke_test_overall": "pass",
+    "chunk_profiles": {
+      "interactive": "partial (estimated compressed chunk \u2248 0.52 MB)",
+      "training": "fail (estimated compressed chunk \u2248 0.52 MB)",
+      "agentic": "pass (catalog\u2192variables\u2192one subset \u2248 2 requests; estimated compressed chunk \u2248 0.52 MB)"
+    }
+  }
+}
