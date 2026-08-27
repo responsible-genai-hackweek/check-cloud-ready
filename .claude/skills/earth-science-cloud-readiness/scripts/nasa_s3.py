@@ -282,8 +282,8 @@ def classify_s3_error(exc: BaseException) -> str:
       running in AWS us-west-2. Caller should print: "S3 credentials
       were minted successfully but access was denied at the bucket/
       object level — this almost always means the request is not
-      running inside AWS us-west-2. Run from a us-west-2 compute
-      environment, or use the HTTPS URL for out-of-region access."
+      running inside AWS us-west-2. Re-run from in-region (us-west-2)
+      compute."
     - "unknown": anything else.
     """
     text = _exception_chain_text(exc)
