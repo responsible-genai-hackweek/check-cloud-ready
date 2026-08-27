@@ -300,7 +300,13 @@ def ranged_probe(url: str, budget: Budget, content_length=None,
 def fs_head_probe(cfs, path: str, budget: Budget) -> dict:
     """HEAD-equivalent over an authenticated filesystem (`fs.info`). Same
     telemetry field names as head_probe so assess.py needs no special case.
-    Raises on auth/region failure; the caller classifies it."""
+    Raises on auth/region failure; the caller classifies it.
+
+    Budget: `cfs` is a CountingFS, whose `info` wrapper already charges
+    `spend(0, 1)` — one request, no bytes — exactly as head_probe does. Do not
+    add a second `budget.spend()` here or every authenticated request is
+    counted twice.
+    """
     out = {"check": "HEAD", "url": path, "transport": "s3-authenticated"}
     t0 = time.monotonic()
     info = cfs.info(path) or {}
@@ -312,7 +318,7 @@ def fs_head_probe(cfs, path: str, budget: Budget) -> dict:
         # S3 GetObject always honours Range; TLS is enforced by the SDK.
         accept_ranges="bytes",
         etag=etag,
-        content_type=info.get("ContentType", info.get("type")),
+        content_type=info.get("ContentType"),
         cors_allow_origin=None,
         redirects=0,
         final_url=path,
@@ -322,10 +328,45 @@ def fs_head_probe(cfs, path: str, budget: Budget) -> dict:
     return out
 
 
+_STORE_METADATA_KEYS = ("zarr.json", ".zmetadata", ".zgroup")
+
+
+def fs_store_head_probe(cfs, path: str, budget: Budget) -> dict:
+    """HEAD-equivalent for a *store root* (Zarr/Icechunk), which is a prefix
+    rather than a single object: try `info` on the root, then on the store's
+    metadata document. Auth/region errors propagate for classification; only
+    "there is no such object" outcomes fall through to the next candidate."""
+    root = path.rstrip("/")
+    last_exc = None
+    for candidate in (root,) + tuple(f"{root}/{k}" for k in _STORE_METADATA_KEYS):
+        try:
+            out = fs_head_probe(cfs, candidate, budget)
+        except BudgetExceeded:
+            raise
+        except Exception as e:
+            if _s3_auth_skip_reason(e):
+                raise  # auth/region: the caller must see and classify it
+            last_exc = e
+            continue
+        if candidate != root:
+            out["store_root"] = root
+            out["note"] = f"store root: HEAD taken on {candidate.rsplit('/', 1)[-1]}"
+        return out
+    return {"check": "HEAD", "url": root, "transport": "s3-authenticated",
+            "status": "skipped", "store_root": root,
+            "reason": "store root: no single object to HEAD"
+                      + (f" ({type(last_exc).__name__}: {last_exc})"
+                         if last_exc else "")}
+
+
 def fs_ranged_probe(cfs, path: str, budget: Budget, content_length=None) -> dict:
     """Ranged reads over an authenticated filesystem (`fs.cat_file`). Emits
     the same field names as ranged_probe (`reads`, `first_bytes_hex`,
-    `first_bytes`) so format sniffing works identically."""
+    `first_bytes`) so format sniffing works identically.
+
+    Budget: as in fs_head_probe, CountingFS's `cat_file` wrapper already
+    charges `spend(len(data), 1)` per read — the same accounting ranged_probe
+    does — so this function must not spend again."""
     out = {"check": "ranged_reads", "reads": [], "transport": "s3-authenticated"}
     ranges = _probe_ranges(content_length)
     status = "pass"
@@ -737,19 +778,39 @@ _OPENERS = {
 
 
 # ------------------------------------------------------------------ main entry
+NO_TOKEN_NOTE = ("skipped: no Earthdata Login token available (set "
+                 "EARTHDATA_TOKEN, EARTHDATA_USERNAME/EARTHDATA_PASSWORD, "
+                 "or ~/.netrc)")
+NOT_NASA_HOST_NOTE = ("skipped: not a NASA Earthdata host — the Earthdata "
+                      "bearer token is never sent to third-party endpoints")
+GENERIC_AUTH_REASON = ("auth: endpoint denied the read (HTTP 401/403); "
+                       "credentials are required and were not supplied")
+
+
+def _bearer_allowed(url, head) -> bool:
+    """The EDL bearer token may only ever reach NASA Earthdata: either the
+    response redirected to urs.earthdata.nasa.gov, or the URL itself looks
+    like NASA Earthdata. A 401/403 from an unrelated host must NOT be
+    answered with the user's Earthdata credential."""
+    if nasa_s3.EDL_HOST in str((head or {}).get("final_url") or ""):
+        return True
+    return nasa_s3.looks_like_nasa_earthdata(url)
+
+
 def _https_probe_with_bearer(probe_url, budget, tel):
-    """HEAD (+ one EDL-bearer retry for protected HTTPS inputs). Returns the
-    Authorization headers to reuse for the ranged probe, or None."""
+    """HEAD (+ one EDL-bearer retry for protected NASA HTTPS inputs). Returns
+    the Authorization headers to reuse for the ranged probe, or None."""
     tel["head"] = head_probe(probe_url, budget)
     h = tel["head"]
     edl_redirect = nasa_s3.EDL_HOST in str(h.get("final_url") or "")
     if not (h.get("http_status") in (401, 403) or edl_redirect):
         return None
+    if not _bearer_allowed(probe_url, h):
+        h["bearer_retry"] = NOT_NASA_HOST_NOTE
+        return None
     token = nasa_s3.edl_bearer_token()
     if not token:
-        h["bearer_retry"] = ("skipped: no Earthdata Login token available "
-                             "(set EARTHDATA_TOKEN, EARTHDATA_USERNAME/"
-                             "EARTHDATA_PASSWORD, or ~/.netrc)")
+        h["bearer_retry"] = NO_TOKEN_NOTE
         return None
     headers = {"Authorization": f"Bearer {token}"}
     retry = head_probe(probe_url, budget, headers=headers)
@@ -758,9 +819,11 @@ def _https_probe_with_bearer(probe_url, budget, tel):
     return headers if retry.get("status") == "pass" else None
 
 
-def _ranged_auth_recovery(probe_url, budget, ranged, content_length, headers):
-    """Some protected HTTPS endpoints answer HEAD but 401 the ranged GET.
-    Retry once with an EDL bearer token; if it still fails, the reads are
+def _ranged_auth_recovery(probe_url, budget, ranged, content_length, headers,
+                          bearer_allowed=False):
+    """Some protected NASA HTTPS endpoints answer HEAD but 401 the ranged GET.
+    Retry once with an EDL bearer token — only when the host is NASA
+    Earthdata; if it still fails (or the token can't be sent), the reads are
     auth-blocked — SKIPPED, never FAILED."""
     def auth_blocked(r):
         return bool({rd.get("http_status") for rd in r.get("reads") or []}
@@ -769,22 +832,23 @@ def _ranged_auth_recovery(probe_url, budget, ranged, content_length, headers):
     if not auth_blocked(ranged):
         return ranged
     if headers is None:
-        token = nasa_s3.edl_bearer_token()
-        if token:
-            retry = ranged_probe(probe_url, budget, content_length,
-                                 headers={"Authorization": f"Bearer {token}"})
-            retry["bearer_auth"] = True
-            ranged = retry
-            if not auth_blocked(ranged):
-                return ranged
+        if not bearer_allowed:
+            ranged["bearer_retry"] = NOT_NASA_HOST_NOTE
         else:
-            ranged["bearer_retry"] = ("skipped: no Earthdata Login token "
-                                      "available (set EARTHDATA_TOKEN, "
-                                      "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, "
-                                      "or ~/.netrc)")
+            token = nasa_s3.edl_bearer_token()
+            if token:
+                retry = ranged_probe(probe_url, budget, content_length,
+                                     headers={"Authorization": f"Bearer {token}"})
+                retry["bearer_auth"] = True
+                ranged = retry
+                if not auth_blocked(ranged):
+                    return ranged
+            else:
+                ranged["bearer_retry"] = NO_TOKEN_NOTE
     ranged["status"] = "skipped"
     ranged["auth_blocked"] = True
-    ranged["reason"] = CREDENTIALS_AUTH_REASON
+    ranged["reason"] = (CREDENTIALS_AUTH_REASON if bearer_allowed
+                        else GENERIC_AUTH_REASON)
     return ranged
 
 
@@ -828,7 +892,13 @@ def run_smoke_test(url: str, fmt: str = "", no_network: bool = False,
                                       "authenticated NASA S3",
                                budget=budget.snapshot())
                     return tel
-                if fmt not in ("zarr", "icechunk"):  # store roots aren't objects
+                if fmt in ("zarr", "icechunk"):
+                    # A store root is a prefix: HEAD its metadata document
+                    # instead, and skip the ranged probe (single-object reads
+                    # are meaningless for a store) — mirroring the HTTPS path,
+                    # which also always produces a head.
+                    tel["head"] = fs_store_head_probe(cfs, path, budget)
+                else:
                     tel["head"] = fs_head_probe(cfs, path, budget)
                     tel["ranged"] = fs_ranged_probe(
                         cfs, path, budget, tel["head"].get("content_length"))
@@ -860,7 +930,8 @@ def run_smoke_test(url: str, fmt: str = "", no_network: bool = False,
                                              headers=headers)
                 if scheme in ("http", "https"):
                     tel["ranged"] = _ranged_auth_recovery(
-                        probe_url, budget, tel["ranged"], content_length, headers)
+                        probe_url, budget, tel["ranged"], content_length, headers,
+                        bearer_allowed=_bearer_allowed(probe_url, tel["head"]))
                 tel["ranged"].pop("first_bytes", None)
                 if tel["ranged"].get("auth_blocked"):
                     tel.update(status="skipped", reason=tel["ranged"]["reason"],

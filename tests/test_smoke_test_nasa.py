@@ -181,6 +181,70 @@ class TestCredentialedSuccess(NasaS3Mixin, unittest.TestCase):
         # detect_format consumes first_bytes_hex from this telemetry
         self.assertEqual(assess.detect_format({"url": NASA_URL}, tel), "hdf5")
 
+    def test_authenticated_probes_charge_the_budget(self):
+        # The authenticated probes go through CountingFS, whose info/cat_file
+        # wrappers spend exactly like the HTTPS probes do: 1 request + 0 bytes
+        # for the HEAD, 1 request + n bytes per ranged read. Pinned here so a
+        # future edit can neither drop nor double the accounting.
+        self.block_network()
+        self.stub_get_fs(_OkFS())
+        tel = smoke_test.run_smoke_test(NASA_URL, "hdf5",
+                                        credentials_url=CREDS_URL)
+        self.assertEqual(tel["budget"]["requests"], 3)  # info + 2 cat_file
+        self.assertEqual(tel["budget"]["bytes"], 2 * smoke_test.HEADER_READ)
+
+    def test_credentialed_zarr_store_root_still_emits_head(self):
+        self.block_network()
+
+        class _StoreFS:
+            """Root is a prefix (no object); the metadata document exists."""
+
+            _strip_protocol = staticmethod(lambda p: p)  # for fsspec.FSMap
+
+            def info(self, path):
+                if path.endswith(".zmetadata"):
+                    return {"name": path, "size": 10551, "type": "file"}
+                raise FileNotFoundError(path)
+
+            def cat_file(self, path, start=None, end=None):
+                raise FileNotFoundError(path)
+
+        self.stub_get_fs(_StoreFS())
+        tel = smoke_test.run_smoke_test("s3://podaac-ops-cumulus-protected/x.zarr",
+                                        "zarr", credentials_url=CREDS_URL)
+        head = tel["head"]
+        self.assertEqual(head["transport"], "s3-authenticated")
+        self.assertEqual(head["status"], "pass")
+        self.assertEqual(head["content_length"], 10551)
+        self.assertNotIn("ranged", tel)  # store roots: ranged stays exempt
+
+        # assess.py must not claim this was a local file
+        checks = assess.score_asset({"url": "s3://podaac-ops-cumulus-protected/x.zarr"},
+                                    "zarr", tel)
+        d_evidence = " ".join(c["evidence"] for c in checks
+                              if c["dimension"] == "D")
+        self.assertNotIn("local file", d_evidence)
+        self.assertNotIn("not live-verified", d_evidence)
+
+    def test_credentialed_zarr_root_without_metadata_is_truthful(self):
+        self.block_network()
+
+        class _EmptyStoreFS:
+            _strip_protocol = staticmethod(lambda p: p)  # for fsspec.FSMap
+
+            def info(self, path):
+                raise FileNotFoundError(path)
+
+            def cat_file(self, path, start=None, end=None):
+                raise FileNotFoundError(path)
+
+        self.stub_get_fs(_EmptyStoreFS())
+        tel = smoke_test.run_smoke_test("s3://podaac-ops-cumulus-protected/x.zarr",
+                                        "zarr", credentials_url=CREDS_URL)
+        self.assertEqual(tel["head"]["transport"], "s3-authenticated")
+        self.assertEqual(tel["head"]["status"], "skipped")
+        self.assertIn("store root", tel["head"]["reason"])
+
     def test_fs_is_cached_per_credentials_url(self):
         self.block_network()
         calls = self.stub_get_fs(_OkFS())
@@ -197,13 +261,87 @@ class TestProtectedHttpsBearer(unittest.TestCase):
         smoke_test.nasa_s3.edl_bearer_token = lambda: value
         self.addCleanup(setattr, smoke_test.nasa_s3, "edl_bearer_token", original)
 
+    def _forbid_token(self):
+        """Any attempt to mint/read an EDL token is a test failure."""
+        original = smoke_test.nasa_s3.edl_bearer_token
+
+        def _boom():
+            self.fail("EDL bearer token requested for a non-NASA host")
+
+        smoke_test.nasa_s3.edl_bearer_token = _boom
+        self.addCleanup(setattr, smoke_test.nasa_s3, "edl_bearer_token", original)
+
+    def _capture_head_probe(self, response):
+        """Replace head_probe with a stub; records the headers it was given."""
+        seen = []
+
+        def fake_head_probe(url, budget, headers=None):
+            seen.append(headers)
+            return dict(response)
+
+        original = smoke_test.head_probe
+        smoke_test.head_probe = fake_head_probe
+        self.addCleanup(setattr, smoke_test, "head_probe", original)
+        return seen
+
+    def test_non_nasa_401_never_receives_the_bearer_token(self):
+        self._forbid_token()
+        seen = self._capture_head_probe(
+            {"check": "HEAD", "status": "skipped", "reason": "auth",
+             "http_status": 401,
+             "final_url": "https://data.example.com/private/x.h5"})
+        tel = {}
+        headers = smoke_test._https_probe_with_bearer(
+            "https://data.example.com/private/x.h5", smoke_test.Budget(), tel)
+        self.assertIsNone(headers)
+        self.assertEqual(seen, [None])  # exactly one probe, no Authorization
+        self.assertIn("not a NASA Earthdata host", tel["head"]["bearer_retry"])
+
+    def test_nasa_401_does_receive_the_bearer_token(self):
+        self._fake_token("test-token")
+        seen = self._capture_head_probe(
+            {"check": "HEAD", "status": "skipped", "reason": "auth",
+             "http_status": 403,
+             "final_url": "https://data.lpdaac.earthdatacloud.nasa.gov/x.h5"})
+        tel = {}
+        smoke_test._https_probe_with_bearer(
+            "https://data.lpdaac.earthdatacloud.nasa.gov/x.h5",
+            smoke_test.Budget(), tel)
+        self.assertEqual(seen[0], None)
+        self.assertEqual(seen[1], {"Authorization": "Bearer test-token"})
+
+    def test_non_nasa_url_redirected_to_edl_may_use_the_token(self):
+        # The heuristic misses plenty of NASA hosts; a URS redirect is proof.
+        self._fake_token("test-token")
+        seen = self._capture_head_probe(
+            {"check": "HEAD", "status": "skipped", "reason": "auth",
+             "http_status": 401,
+             "final_url": "https://urs.earthdata.nasa.gov/oauth/authorize?x=1"})
+        smoke_test._https_probe_with_bearer(
+            "https://opaque.example.org/x.h5", smoke_test.Budget(), {})
+        self.assertEqual(seen[1], {"Authorization": "Bearer test-token"})
+
+    def test_non_nasa_ranged_401_is_skipped_without_a_token(self):
+        self._forbid_token()
+        ranged = {"check": "ranged_reads", "status": "fail",
+                  "reads": [{"range": "0-16383", "http_status": 401, "bytes": 27,
+                             "expected": 16384, "ok": False}]}
+        out = smoke_test._ranged_auth_recovery(
+            "https://data.example.com/private/x.h5", smoke_test.Budget(),
+            ranged, None, None, bearer_allowed=False)
+        self.assertEqual(out["status"], "skipped")
+        self.assertTrue(out["auth_blocked"])
+        self.assertIn("not a NASA Earthdata host", out["bearer_retry"])
+        self.assertTrue(out["reason"].startswith("auth:"), out["reason"])
+
     def test_auth_blocked_reads_are_skipped_not_failed(self):
         self._fake_token(None)
         ranged = {"check": "ranged_reads", "status": "fail",
                   "reads": [{"range": "0-16383", "http_status": 401, "bytes": 27,
                              "expected": 16384, "ok": False}]}
         out = smoke_test._ranged_auth_recovery(
-            "https://example.gov/x.h5", smoke_test.Budget(), ranged, None, None)
+            "https://nisar.asf.earthdatacloud.nasa.gov/x.h5",
+            smoke_test.Budget(), ranged, None, None, bearer_allowed=True)
         self.assertEqual(out["status"], "skipped")
         self.assertTrue(out["auth_blocked"])
         self.assertTrue(out["reason"].startswith("auth:"), out["reason"])
@@ -227,7 +365,8 @@ class TestProtectedHttpsBearer(unittest.TestCase):
                    "reads": [{"range": "0-16383", "http_status": 403,
                               "bytes": 0, "expected": 16384, "ok": False}]}
         out = smoke_test._ranged_auth_recovery(
-            "https://example.gov/x.h5", smoke_test.Budget(), blocked, None, None)
+            "https://nisar.asf.earthdatacloud.nasa.gov/x.h5",
+            smoke_test.Budget(), blocked, None, None, bearer_allowed=True)
         self.assertEqual(out["status"], "pass")
         self.assertTrue(out["bearer_auth"])
         self.assertEqual(seen["headers"], {"Authorization": "Bearer test-token"})
