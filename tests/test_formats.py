@@ -73,6 +73,14 @@ class TestSniffBytesMagic(unittest.TestCase):
         out = sniff_bytes(b"MM\x00*" + b"\x00" * 20)
         self.assertEqual(out["format"], "cog")
 
+    def test_bigtiff_little_endian(self):
+        out = sniff_bytes(b"II+\x00" + b"\x00" * 20)
+        self.assertEqual(out["format"], "cog")
+
+    def test_bigtiff_big_endian(self):
+        out = sniff_bytes(b"MM\x00+" + b"\x00" * 20)
+        self.assertEqual(out["format"], "cog")
+
     def test_parquet(self):
         out = sniff_bytes(b"PAR1" + b"\x00" * 20)
         self.assertEqual(out["format"], "parquet")
@@ -80,6 +88,52 @@ class TestSniffBytesMagic(unittest.TestCase):
     def test_grib(self):
         out = sniff_bytes(b"GRIB" + b"\x00" * 20)
         self.assertEqual(out["format"], "grib2")
+
+    def test_flatgeobuf(self):
+        out = sniff_bytes(b"fgb" + b"\x00" * 20)
+        self.assertEqual(out["format"], "flatgeobuf")
+
+    def test_las(self):
+        out = sniff_bytes(b"LASF" + b"\x00" * 20)
+        self.assertEqual(out["format"], "las")
+
+    def test_pmtiles(self):
+        out = sniff_bytes(b"PMTiles" + b"\x00" * 20)
+        self.assertEqual(out["format"], "pmtiles")
+
+    def test_zip(self):
+        out = sniff_bytes(b"PK\x03\x04" + b"\x00" * 20)
+        self.assertEqual(out["format"], "zip")
+
+    def test_gzip(self):
+        out = sniff_bytes(b"\x1f\x8b" + b"\x00" * 20)
+        self.assertEqual(out["format"], "gzip")
+
+    def test_shapefile(self):
+        out = sniff_bytes(b"\x00\x00\x27\x0a" + b"\x00" * 20)
+        self.assertEqual(out["format"], "shapefile")
+
+    def test_tar_from_long_head(self):
+        head = bytearray(300)
+        head[257:262] = b"ustar"
+        out = sniff_bytes(bytes(head))
+        self.assertEqual(out["format"], "tar")
+
+    def test_tar_via_offset_reads_when_head_short(self):
+        head = b"\x00" * 32  # too short to contain byte 257 directly
+
+        def offset_reads(offset, size):
+            if offset == 257:
+                return b"ustar"
+            return b"\x00" * size
+
+        out = sniff_bytes(head, offset_reads=offset_reads)
+        self.assertEqual(out["format"], "tar")
+
+    def test_short_head_not_mistaken_for_tar_without_offset_reads(self):
+        head = b"\x00" * 32
+        out = sniff_bytes(head)
+        self.assertNotEqual(out["format"], "tar")
 
     def test_kerchunk_json_refs(self):
         blob = json.dumps({"refs": {"a": "b"}, "version": 1}).encode()

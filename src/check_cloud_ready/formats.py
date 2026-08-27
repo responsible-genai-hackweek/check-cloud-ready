@@ -134,18 +134,61 @@ def sniff_bytes(head: bytes, *, offset_reads=None) -> dict:
         notes.append("possibly kerchunk parquet references or GeoParquet")
         return out
 
-    if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"):
+    if head[:4] in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
         out["format"] = "cog"
-        notes.append("TIFF magic; COG-ness not verified from bytes alone")
+        notes.append("TIFF/BigTIFF magic; COG-ness not verified from bytes alone")
         return out
 
     if head.startswith(b"GRIB"):
         out["format"] = "grib2"
         return out
 
+    if head[:3] == b"fgb":
+        out["format"] = "flatgeobuf"
+        return out
+
+    if head[:4] == b"LASF":
+        out["format"] = "las"
+        return out
+
+    if head[:7] == b"PMTiles":
+        out["format"] = "pmtiles"
+        return out
+
+    if head[:4] == b"PK\x03\x04":
+        out["format"] = "zip"
+        return out
+
+    if head[:2] == b"\x1f\x8b":
+        out["format"] = "gzip"
+        return out
+
+    if _is_tar(head, offset_reads):
+        out["format"] = "tar"
+        return out
+
+    if head[:4] == b"\x00\x00\x27\x0a":  # shapefile magic (9994 big-endian)
+        out["format"] = "shapefile"
+        return out
+
     out["format"] = "unknown"
     notes.append(f"unrecognized magic bytes: {head[:8].hex()}")
     return out
+
+
+def _is_tar(head: bytes, offset_reads) -> bool:
+    """Tar files carry "ustar" at byte offset 257. Use head if it's long
+    enough; otherwise fall back to offset_reads (e.g. for a remote read
+    that only fetched a short prefix).
+    """
+    if len(head) > 262:
+        return head[257:262] == b"ustar"
+    if offset_reads is not None:
+        try:
+            return offset_reads(257, 5) == b"ustar"
+        except Exception:
+            return False
+    return False
 
 
 # ---------------------------------------------------------- hdf5 refinement
