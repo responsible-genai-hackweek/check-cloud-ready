@@ -115,6 +115,25 @@ class TestGetFsCredentialsUrl(unittest.TestCase):
             self.assertEqual(type(fs).__name__, "FsspecStore")
 
 
+class TestGetFsGranuleIdInvalid(unittest.TestCase):
+    def test_invalid_granule_id_raises_runtime_error_not_system_exit(self):
+        # resolve_granule.resolve() is CLI-style and calls sys.exit() on
+        # an invalid granule ID (fails its local regex check, no network
+        # involved). get_fs must convert that SystemExit into a
+        # catchable RuntimeError rather than letting it propagate and
+        # kill the process out from under an `except Exception` caller.
+        with self.assertRaises(RuntimeError) as ctx:
+            get_fs("s3://some-bucket/x", granule_id="not-a-valid-id")
+        self.assertNotIsInstance(ctx.exception, SystemExit)
+
+        try:
+            get_fs("s3://some-bucket/x", granule_id="not-a-valid-id")
+        except SystemExit:
+            self.fail("get_fs leaked a SystemExit instead of raising RuntimeError")
+        except Exception:
+            pass  # expected: caught as a plain Exception
+
+
 class TestEdlBearerToken(unittest.TestCase):
     def setUp(self):
         self._saved_env = {

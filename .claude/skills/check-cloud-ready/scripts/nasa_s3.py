@@ -196,7 +196,15 @@ def get_fs(url, *, anon=False, credentials_url=None, granule_id=None,
     """
     if granule_id:
         rg = _import_resolve_granule()
-        result = rg.resolve(granule_id)
+        # resolve_granule.resolve() is CLI-style: it calls sys.exit(msg)
+        # on invalid ID / CMR HTTP failure / 404, which raises
+        # SystemExit (a BaseException, not Exception). Convert to a
+        # RuntimeError so callers using `except Exception` (including
+        # this module's own CLI below) can actually catch it.
+        try:
+            result = rg.resolve(granule_id)
+        except SystemExit as e:
+            raise RuntimeError(f"granule resolution failed: {e}") from e
         credentials_url = result.get("credentials_url")
         if not credentials_url:
             raise RuntimeError(
