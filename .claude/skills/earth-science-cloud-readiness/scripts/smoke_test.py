@@ -26,6 +26,7 @@ import sys
 import time
 import argparse
 from urllib.parse import urlparse
+import builtins
 
 # ---------------------------------------------------------------- optional deps
 def _try(name):
@@ -36,6 +37,7 @@ def _try(name):
 
 httpx = _try("httpx")
 fsspec = _try("fsspec")
+earthaccess = _try("earthaccess")
 rasterio = _try("rasterio")
 zarr = _try("zarr")
 xr = _try("xarray")
@@ -150,6 +152,8 @@ class Budget:
 
 
 # ---------------------------------------------------------------- HTTP probes
+_NISAR_AUTH_FS = None  # Cache authenticated S3 filesystem for NISAR
+
 def _to_https(url: str) -> str:
     """Best-effort conversion of s3://, gs://, az:// to a probe-able HTTPS URL.
     Region-specific endpoints may be needed; failures are reported, not fatal."""
@@ -304,6 +308,7 @@ class CountingFS:
 
 
 def _counting_fs_for(url: str, budget: Budget, no_network=False):
+    global _NISAR_AUTH_FS
     if fsspec is None or no_network:
         return None, None
     p = urlparse(url)
@@ -312,7 +317,25 @@ def _counting_fs_for(url: str, budget: Budget, no_network=False):
         fs = fsspec.filesystem("http")
         path = url
     elif proto == "s3":
-        fs = fsspec.filesystem("s3", anon=True)
+        fs = None
+        # Try earthaccess for NASA endpoints (e.g., NISAR)
+        if earthaccess is not None and ("nisar" in url.lower() or "daac" in url.lower() or "earthdatacloud" in url.lower()):
+            try:
+                # Reuse cached filesystem if already authenticated
+                if _NISAR_AUTH_FS is None:
+                    auth = earthaccess.login(strategy="all", persist=True)
+                    if auth:
+                        endpoint = 'https://nisar.asf.earthdatacloud.nasa.gov/s3credentials'
+                        _NISAR_AUTH_FS = earthaccess.get_s3_filesystem(endpoint=endpoint)
+                        print(f"[smoke_test] Authenticated to NISAR via earthaccess", file=sys.stderr)
+                fs = _NISAR_AUTH_FS
+            except Exception as e:
+                print(f"[smoke_test] earthaccess auth failed ({e}); using anonymous S3", file=sys.stderr)
+                fs = None
+
+        # Fallback to anonymous S3 access
+        if fs is None:
+            fs = fsspec.filesystem("s3", anon=True)
         path = url
     elif proto == "gs":
         fs = fsspec.filesystem("gcs", token="anon")
