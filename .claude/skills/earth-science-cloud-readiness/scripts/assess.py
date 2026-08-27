@@ -797,18 +797,31 @@ def score_asset(asset, fmt, tel):
                         None if rs == "pass" else "enable/verify HTTP Range support "
                         "(206 responses) on the data endpoint"))
         auth_ok = head.get("http_status") not in (401, 403)
+        if head.get("transport") == "s3-authenticated":
+            d2_evidence = ("authenticated S3 head OK"
+                           if head.get("status") == "pass"
+                           else f"authenticated S3 head status={head.get('status')}")
+        else:
+            d2_evidence = f"HTTP {head.get('http_status')}"
         checks.append(C("D2-auth", "D", 3, 3 if auth_ok else 1,
                         "pass" if auth_ok else "partial",
-                        f"HTTP {head.get('http_status')}",
+                        d2_evidence,
                         None if auth_ok else "document auth clearly; flag requester-pays"))
         tls = head.get("tls_ok")
-        cors = head.get("cors_allow_origin")
-        d3 = (2 if tls else 0) + (1 if cors else 0)
-        checks.append(C("D3-https-cors", "D", 3, d3,
-                        "pass" if d3 == 3 else "partial",
-                        f"tls={tls}, CORS Allow-Origin={cors!r}",
-                        None if d3 == 3 else "serve over HTTPS; add CORS headers if "
-                        "browser use is plausible"))
+        if head.get("transport") == "s3-authenticated":
+            # SDK-transport S3: TLS is enforced by the SDK and CORS is not
+            # applicable (no browser/XHR path involved), so the CORS aspect
+            # gets full credit rather than being scored against the asset.
+            checks.append(C("D3-https-cors", "D", 3, 3, "pass",
+                            "S3 SDK transport; CORS n/a", None))
+        else:
+            cors = head.get("cors_allow_origin")
+            d3 = (2 if tls else 0) + (1 if cors else 0)
+            checks.append(C("D3-https-cors", "D", 3, d3,
+                            "pass" if d3 == 3 else "partial",
+                            f"tls={tls}, CORS Allow-Origin={cors!r}",
+                            None if d3 == 3 else "serve over HTTPS; add CORS headers if "
+                            "browser use is plausible"))
         redirects = head.get("redirects", 0)
         html = "text/html" in str(head.get("content_type", ""))
         d4 = 3 if (redirects <= 1 and not html) else (1 if not html else 0)

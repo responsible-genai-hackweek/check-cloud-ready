@@ -107,6 +107,9 @@ Decision: **is the item URL publicly accessible?**
 
   **Failure classification** (never FAILED — always SKIPPED, since these are
   access-environment facts, not dataset defects):
+  - `nasa-credentials-required` — the URL is NASA Earthdata S3 and no
+    credentials were supplied at all. Fix: pass `--granule-id` or
+    `--credentials-url` (recommended), or `--earthaccess-fallback`.
   - `credentials-endpoint-auth` — EDL/URS rejected the credentials-endpoint
     request (bad/missing/expired EDL credentials). Fix: check
     `EARTHDATA_TOKEN` / `EARTHDATA_USERNAME`+`EARTHDATA_PASSWORD` / `~/.netrc`.
@@ -123,7 +126,7 @@ path:
 | Format | Opened / validated with | Check |
 |---|---|---|
 | HDF5 / NetCDF | h5py / xarray | chunking, compression, structure |
-| Zarr | (xarray/zarr) | **GeoZarr** spec conformance | chunking, compression, structure |
+| Zarr | (xarray/zarr) | **GeoZarr** spec conformance; chunking, compression, structure |
 | COG | rasterio | **valid COG** check |
 | COPC | pdal | **valid COPC** check |
 

@@ -226,6 +226,22 @@ class TestCredentialedSuccess(NasaS3Mixin, unittest.TestCase):
         self.assertNotIn("local file", d_evidence)
         self.assertNotIn("not live-verified", d_evidence)
 
+        # D2-auth: credentialed heads have no http_status; evidence must not
+        # render the misleading "HTTP None".
+        d2 = next(c for c in checks if c["id"] == "D2-auth")
+        self.assertNotIn("HTTP None", d2["evidence"])
+        self.assertEqual(d2["status"], "pass")
+
+        # D3-https-cors: SDK-transport S3 has no CORS concept, so the
+        # credentialed path must not be dinged for missing CORS headers nor
+        # tell the provider to "serve over HTTPS; add CORS" (both wrong for
+        # this transport).
+        d3 = next(c for c in checks if c["id"] == "D3-https-cors")
+        self.assertEqual(d3["status"], "pass")
+        self.assertEqual(d3["points_awarded"], d3["points_possible"])
+        self.assertIsNone(d3["remediation"])
+        self.assertNotIn("serve over HTTPS; add CORS", str(d3.get("remediation")))
+
     def test_credentialed_zarr_root_without_metadata_is_truthful(self):
         self.block_network()
 
