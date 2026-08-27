@@ -36,7 +36,9 @@ so every finding should end in a recommendation they can implement, not just a g
 - **Never ask the user to type credentials into the conversation.** Earthdata Login
   and S3 credentials come from `~/.netrc` or environment variables — see
   `references/access-and-auth.md`. If credentials are needed and absent, pause and
-  tell the user exactly what to set up, then continue once they confirm.
+  tell the user exactly what to set up, then continue once they confirm. This maps
+  exactly onto obstore's credential resolution order: `EARTHDATA_TOKEN`, or
+  `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `~/.netrc`.
 - **Measure, don't guess.** Use the bundled scripts for anything quantitative
   (format detection, access probing, chunk statistics, compression benchmarks).
   Reserve your own judgment for interpretation and recommendations.
@@ -57,32 +59,51 @@ so every finding should end in a recommendation they can implement, not just a g
 The scripts degrade gracefully, but the full assessment wants:
 
 ```bash
-pip install requests boto3 s3fs fsspec xarray zarr h5py netCDF4 numcodecs zstandard earthaccess --quiet
+pip install requests boto3 s3fs fsspec xarray zarr h5py netCDF4 numcodecs zstandard obstore --quiet
 # (add --break-system-packages if pip refuses on an externally-managed environment)
 ```
 
 Install lazily — each script tells you which import it's missing. `cfchecker` or the
-IOOS `compliance-checker` are only needed if the user opts into the CF check.
+IOOS `compliance-checker` are only needed if the user opts into the CF check. Install
+`earthaccess` only if the user chooses the earthaccess fallback in Step 1.
 
 ## Workflow
 
 ### Step 1 — Triage the entrypoint
 
-The user supplies an entrypoint. Classify it:
+The user supplies an entrypoint. This mirrors the canonical decision flow in the
+repo-root `auth-workflow.md` — consult it for the full rationale. Classify:
+
+1. **CMR granule concept ID** (pattern `G<digits>-<PROVIDER>`, e.g.
+   `G4289749526-ASF`): the recommended NASA Earthdata entrypoint. Run
+   `python3 scripts/resolve_granule.py <id>` to get the granule's s3 data URL(s) and
+   the DAAC's `/s3credentials` endpoint in one lookup; pass `--credentials-url` to
+   every subsequent script. If the granule lists multiple s3 URLs, ask the user
+   which file(s) to assess.
+2. **URL inputs**: probe public access first (Step 2 script) — public data goes
+   straight to assessment, no credential setup needed.
+3. **Protected S3** (NASA-looking per the `nasa_s3.py` heuristic
+   `looks_like_nasa_earthdata`, or any anon-403 bucket the user confirms is NASA):
+   ask the user via AskUserQuestion —
+   - **(a) obstore (recommended)**: do they have a CMR granule ID? If yes, go to
+     bullet 1. If not, can they provide the DAAC's `/s3credentials` endpoint
+     directly? If not, offer the closest guesses from `KNOWN_CREDENTIALS_ENDPOINTS`
+     in `scripts/nasa_s3.py` and confirm which looks right.
+   - **(b) earthaccess fallback** (opt-in only).
+   Never offer HTTPS as a substitute for NASA S3 data. State plainly: even with
+   valid credentials, NASA direct-S3 reads only work from us-west-2 compute; from
+   elsewhere the skill verifies credential minting and marks byte-range/chunking
+   criteria "not assessed — requires in-region compute".
+4. **Protected HTTPS *inputs*** (EDL redirect or 401): assessed with an EDL bearer
+   token (`Authorization: Bearer`), which `scripts/probe_access.py` handles
+   automatically. Bearer auth is for HTTPS inputs only — never a stand-in for an
+   s3:// input.
 
 - **Local file/directory**: no network questions needed. Note in the report that the
   *hosting* criterion can't be evaluated from a local copy — then ask whether a
   cloud-hosted location exists for this data; if yes, prefer assessing that URL
   (chunking measured locally is identical, but access and hosting are the point).
-- **HTTPS URL**: ask whether there is an object-storage (s3://...) location for the
-  same data. Many providers front object storage with HTTPS — both may be worth
-  probing. Also ask: is the data public, or does it require Earthdata Login (EDL) or
-  other auth? If auth is required, follow `references/access-and-auth.md` before
-  probing.
-- **S3 URL (or GCS/Azure)**: ask public vs. authenticated. Warn the user up front
-  that S3 access from outside the bucket's region may fail or be slow, and that this
-  is expected — you'll diagnose it.
-- **Zarr/Icechunk store URL**: same as above; store-level probing differs (many
+- **Zarr/Icechunk store URL**: triage as above; store-level probing differs (many
   small objects rather than one file) and Step 3 will detect the flavor.
 
 ### Step 2 — Probe access
@@ -96,6 +117,21 @@ user rather than a raw stack trace.
 
 Range-request support is the load-bearing result: without it, criterion 2 fails no
 matter how good the format is.
+
+Pass `--credentials-url <url>` or `--granule-id <id>` for NASA Earthdata S3 access;
+the script then also runs an authenticated probe and records it under
+`out["authenticated"]`:
+
+- `classification: "credentials-endpoint-auth"` — EDL credentials are missing or
+  invalid. Pause, have the user fix their EDL setup (`EARTHDATA_TOKEN`,
+  `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `~/.netrc`), then resume.
+- `classification: "in-region-only"` — expected: credentials minted successfully
+  but S3 denied the read from this network. The hosting row still PASSes; record
+  the constraint and mark byte-range/chunking criteria "not assessed — requires
+  in-region compute".
+
+For EDL-protected HTTPS *inputs*, the script retries once with an EDL bearer token
+and records the result under `out["https_authenticated"]`.
 
 ### Step 3 — Identify the format
 
@@ -238,7 +274,8 @@ Read these when the step needs them, not before:
 - `references/compression.md` — codec shortlist, benchmark grid, decision rules, lossy options.
 - `references/formats.md` — detection details and per-format assessment specifics; future formats.
 - `references/conventions.md` — CF and GeoZarr checks.
-- `references/access-and-auth.md` — EDL via .netrc/earthaccess, S3 region/auth error diagnosis.
+- `references/access-and-auth.md` — EDL via obstore/.netrc, NASA S3 via CMR granule
+  resolution, S3 region/auth error diagnosis.
 
 ## Scripts
 
@@ -249,3 +286,8 @@ All scripts print JSON to stdout and human-readable notes to stderr; run with
 - `scripts/detect_format.py` — magic bytes + store-layout format identification.
 - `scripts/chunk_report.py` — per-variable chunk geometry and size statistics.
 - `scripts/compression_bench.py` — codec grid benchmark on sampled chunks.
+- `scripts/resolve_granule.py` — CMR granule concept ID → s3 data URL(s) + DAAC
+  `/s3credentials` endpoint.
+- `scripts/nasa_s3.py` — shared NASA Earthdata auth helper (`get_fs`,
+  `classify_s3_error`, `looks_like_nasa_earthdata`, `KNOWN_CREDENTIALS_ENDPOINTS`,
+  `edl_bearer_token`) imported by the other scripts; not normally run directly.

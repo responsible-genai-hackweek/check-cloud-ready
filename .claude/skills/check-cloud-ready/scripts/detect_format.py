@@ -2,6 +2,7 @@
 """Identify a dataset's format from magic bytes and store layout.
 
 Usage: python3 detect_format.py <url_or_path> [--anon]
+                                [--credentials-url URL] [--granule-id G...-PROVIDER]
 
 Distinguishes: HDF4, HDF5, NetCDF-3 (classic/64-bit/CDF-5), NetCDF-4,
 Zarr v2, Zarr v3, Icechunk, Kerchunk/VirtualiZarr reference JSON or parquet.
@@ -9,7 +10,11 @@ Prints JSON to stdout.
 """
 import argparse
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nasa_s3
 
 MAGIC = [
     (b"\x89HDF\r\n\x1a\n", "HDF5"),
@@ -19,6 +24,25 @@ MAGIC = [
     (b"\x0e\x03\x13\x01", "HDF4"),
 ]
 HDF5_OFFSETS = [0, 512, 1024, 2048, 4096]  # superblock may follow a user block
+
+_CLASSIFICATION_HINTS = {
+    "credentials-endpoint-auth": (
+        "EDL credentials missing/invalid — set EARTHDATA_TOKEN, "
+        "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, or ~/.netrc"),
+    "in-region-only": (
+        "credentials minted successfully; S3 denied from this network — "
+        "expected outside us-west-2; re-run in-region"),
+}
+
+
+def _classify_and_annotate(out, exc):
+    """On a credentialed-path auth error, add classification + hint to
+    `out` (mutated in place). Never rewrites to HTTPS."""
+    classification = nasa_s3.classify_s3_error(exc)
+    out["classification"] = classification
+    hint = _CLASSIFICATION_HINTS.get(classification)
+    if hint:
+        out["hint"] = hint
 
 
 class _LocalFS:
@@ -36,9 +60,12 @@ class _LocalFS:
         return os.path.isdir(path)
 
 
-def get_fs(url, anon):
+def get_fs(url, anon, credentials_url=None, granule_id=None):
     if "://" not in url:
         return _LocalFS(), url
+    if url.startswith("s3://") and (credentials_url or granule_id):
+        return nasa_s3.get_fs(url, anon=anon, credentials_url=credentials_url,
+                              granule_id=granule_id)
     try:
         import fsspec
     except ImportError:
@@ -151,10 +178,23 @@ def main():
     ap.add_argument("url")
     ap.add_argument("--anon", action="store_true", default=None,
                     help="force anonymous S3 access")
+    ap.add_argument("--credentials-url", help="DAAC s3credentials endpoint URL")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID, resolved via resolve_granule.py "
+                         "(ignored if --credentials-url is also given)")
     a = ap.parse_args()
     anon = True if a.anon else False
     out = {"url": a.url}
-    fs, path = get_fs(a.url, anon)
+
+    credentialed = bool(a.credentials_url or a.granule_id)
+    try:
+        fs, path = get_fs(a.url, anon, credentials_url=a.credentials_url,
+                          granule_id=a.granule_id)
+    except RuntimeError as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        _classify_and_annotate(out, e)
+        print(json.dumps(out, indent=2, default=str))
+        return
 
     isdir = False
     try:
@@ -170,9 +210,14 @@ def main():
             out = sniff_file(fs, path, out)
     except Exception as e:
         # Maybe it's a store after all (file open on a prefix fails)
-        store = sniff_store(fs, path, out)
+        try:
+            store = sniff_store(fs, path, out)
+        except Exception:
+            store = None
         if store is None:
             out["error"] = f"{type(e).__name__}: {e}"
+            if credentialed:
+                _classify_and_annotate(out, e)
         else:
             out = store
     print(json.dumps(out, indent=2, default=str))

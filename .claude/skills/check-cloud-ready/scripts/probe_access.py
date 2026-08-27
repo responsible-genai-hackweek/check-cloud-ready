@@ -3,6 +3,7 @@
 HTTP range-request support.
 
 Usage: python3 probe_access.py <url> [--timeout 10] [--signed]
+                                [--credentials-url URL] [--granule-id G...-PROVIDER]
 
 Prints a JSON result to stdout; human-readable notes to stderr.
 Exit code 0 even on probe failures (the failure IS the result); nonzero only
@@ -10,8 +11,13 @@ for usage/dependency errors.
 """
 import argparse
 import json
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nasa_s3
+import resolve_granule
 
 
 def note(msg):
@@ -66,6 +72,96 @@ def probe_https(url, timeout):
         r.close()
     except Exception as e:
         out["range_get_error"] = f"{type(e).__name__}: {e}"
+
+    # EDL-protected HTTPS: retry once with a bearer token if EDL was detected
+    # (redirect to urs.earthdata.nasa.gov), or the host looks like NASA
+    # Earthdata and the unauthenticated probe came back 401/403.
+    looks_nasa = nasa_s3.looks_like_nasa_earthdata(url)
+    unauth_denied = out.get("head_status") in (401, 403) or \
+        out.get("range_get_status") in (401, 403)
+    if out.get("auth_detected") == "earthdata-login" or (looks_nasa and unauth_denied):
+        token = nasa_s3.edl_bearer_token()
+        if token is None:
+            out["https_authenticated"] = {
+                "note": "no EDL bearer token available - set EARTHDATA_TOKEN, "
+                        "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, or ~/.netrc"}
+        else:
+            out["https_authenticated"] = probe_https_bearer(url, timeout, token)
+    return out
+
+
+def probe_https_bearer(url, timeout, token):
+    """Retry HEAD + range GET once with an EDL Authorization: Bearer header."""
+    import requests
+    headers = {"Authorization": f"Bearer {token}"}
+    out = {"scheme": "https", "url": url}
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+        out["head_status"] = r.status_code
+    except Exception as e:
+        out["head_error"] = f"{type(e).__name__}: {e}"
+    try:
+        t0 = time.monotonic()
+        h = dict(headers, **{"Range": "bytes=0-1023"})
+        r = requests.get(url, headers=h, timeout=timeout, allow_redirects=True,
+                         stream=True)
+        body = r.raw.read(2048)
+        out["range_get_status"] = r.status_code
+        out["range_ttfb_s"] = round(time.monotonic() - t0, 3)
+        if r.status_code == 206:
+            out["range_requests"] = "supported"
+        elif r.status_code == 200:
+            out["range_requests"] = "ignored (200 with full body)"
+        elif r.status_code in (401, 403):
+            out["range_requests"] = "unknown (bearer token rejected)"
+        else:
+            out["range_requests"] = f"unexpected status {r.status_code}"
+        out["first_bytes_hex"] = body[:16].hex() if body else None
+        r.close()
+    except Exception as e:
+        out["range_get_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+_CLASSIFICATION_HINTS = {
+    "credentials-endpoint-auth": (
+        "EDL credentials missing/invalid — set EARTHDATA_TOKEN, "
+        "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, or ~/.netrc"),
+    "in-region-only": (
+        "credentials minted successfully; S3 denied from this network — "
+        "expected outside us-west-2; re-run in-region"),
+}
+
+
+def probe_authenticated_s3(url, timeout, credentials_url):
+    """Authenticated S3 probe via obstore + NasaEarthdataCredentialProvider."""
+    try:
+        import obstore
+        from obstore.store import S3Store
+        from obstore.auth.earthdata import NasaEarthdataCredentialProvider
+    except ImportError:
+        return {"error": "obstore not installed - pip install 'obstore>=0.9'"}
+
+    bucket, _, key = url[5:].partition("/")
+    out = {"credentials_url": credentials_url}
+    cp = NasaEarthdataCredentialProvider(credentials_url)
+    try:
+        store = S3Store.from_url(f"s3://{bucket}", credential_provider=cp)
+        t0 = time.monotonic()
+        obstore.head(store, key)
+        obstore.get_range(store, key, start=0, end=1024)
+        out["ok"] = True
+        out["latency_s"] = round(time.monotonic() - t0, 3)
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = f"{type(e).__name__}: {e}"
+        classification = nasa_s3.classify_s3_error(e)
+        out["classification"] = classification
+        hint = _CLASSIFICATION_HINTS.get(classification)
+        if hint:
+            out["hint"] = hint
+    finally:
+        cp.close()
     return out
 
 
@@ -119,11 +215,13 @@ def probe_s3(url, timeout, signed):
             if code in ("AccessDenied", "403"):
                 res["hint"] = (
                     "403 from S3 can mean: credentials required, requester-pays, "
-                    "or a bucket policy restricting access to in-region compute "
-                    "(common for NASA Earthdata direct-S3 buckets, usually "
-                    "us-west-2). If this is an Earthdata bucket, assess via the "
-                    "HTTPS/EDL endpoint instead, or run in-region with "
-                    "earthaccess.get_s3_credentials().")
+                    "or a bucket policy restricting to in-region compute (NASA "
+                    "Earthdata direct-S3, usually us-west-2). If this is NASA "
+                    "Earthdata data, the recommended path is a CMR granule "
+                    "concept ID: run resolve_granule.py <granule-id> and "
+                    "re-run this probe with --credentials-url. An out-of-region "
+                    "403 with valid credentials is expected — assessment then "
+                    "needs in-region compute.")
             elif code in ("301", "PermanentRedirect"):
                 res["hint"] = f"Wrong region endpoint; bucket is in {region}."
         except Exception as e:
@@ -152,13 +250,31 @@ def main():
     ap.add_argument("--timeout", type=float, default=10)
     ap.add_argument("--signed", action="store_true",
                     help="also try with ambient AWS credentials")
+    ap.add_argument("--credentials-url", help="DAAC s3credentials endpoint URL")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID, resolved via resolve_granule.py "
+                         "(ignored if --credentials-url is also given)")
     a = ap.parse_args()
     if a.url.startswith("s3://"):
         out = probe_s3(a.url, a.timeout, a.signed)
+        credentials_url = a.credentials_url
+        if not credentials_url and a.granule_id:
+            try:
+                resolved = resolve_granule.resolve(a.granule_id)
+                credentials_url = resolved.get("credentials_url")
+                if not credentials_url:
+                    out["authenticated"] = {
+                        "error": "granule has no S3 credentials endpoint in "
+                                 "CMR - is this DAAC in Earthdata Cloud?"}
+            except SystemExit as e:
+                out["authenticated"] = {"error": f"granule resolution failed: {e}"}
+                credentials_url = None
+        if credentials_url:
+            out["authenticated"] = probe_authenticated_s3(
+                a.url, a.timeout, credentials_url)
     elif a.url.startswith(("http://", "https://")):
         out = probe_https(a.url, a.timeout)
     else:
-        import os
         out = {"scheme": "local", "url": a.url,
                "exists": os.path.exists(a.url),
                "note": "Local path - hosting/access criteria not assessable; "

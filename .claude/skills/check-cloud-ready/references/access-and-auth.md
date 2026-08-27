@@ -5,7 +5,11 @@
 Never ask the user to paste usernames, passwords, or long-lived tokens into the
 conversation — the transcript persists. Instead:
 
-**Earthdata Login (EDL)** — either of:
+**Earthdata Login (EDL)** — in order of precedence:
+
+1. `EARTHDATA_TOKEN` environment variable (a bearer token).
+2. `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD` environment variables.
+3. `~/.netrc`:
 
 ```
 # ~/.netrc  (chmod 600)
@@ -14,15 +18,47 @@ machine urs.earthdata.nasa.gov
     password YOUR_PASSWORD
 ```
 
-or environment variables `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD`. Then
-`earthaccess.login()` picks them up automatically and can mint HTTPS bearer
-tokens and temporary in-region S3 credentials (`earthaccess.get_s3_credentials()`
-per DAAC). If neither is set, pause, show the user the snippet above, and resume
-when they say it's in place. Verify with a probe, not by asking them to echo
-secrets.
+This is exactly the order obstore's `NasaEarthdataCredentialProvider` resolves
+credentials in — the scripts in this skill use it directly, so setting up any one
+of the three is sufficient. If none is set, pause, show the user the snippet
+above, and resume when they say it's in place. Verify with a probe, not by asking
+them to echo secrets.
+
+`earthaccess` is a **fallback only, at the user's explicit choice** (Step 1,
+option (b)) — not the default path. See "earthaccess fallback" below.
 
 **AWS** — standard chain: env vars, `~/.aws/credentials`, instance profile.
 Never ask for key material in chat.
+
+## NASA Earthdata S3 — the recommended path
+
+The most reliable way to get NASA Earthdata Cloud S3 access is via a CMR granule
+concept ID, not a hardcoded DAAC table:
+
+1. Granule concept ID (e.g. `G4289749526-ASF`) →
+   `python3 scripts/resolve_granule.py <id>` → fetches
+   `https://cmr.earthdata.nasa.gov/search/concepts/<id>.umm_json`.
+2. In the granule's `RelatedUrls`, exactly one entry ends in `/s3credentials` — the
+   DAAC's S3-credentials endpoint. This is carried in CMR metadata per granule, so
+   it's more reliable than earthaccess's built-in DAAC table (which is missing
+   endpoints for some DAACs/missions — NISAR's
+   `https://nisar.asf.earthdatacloud.nasa.gov/s3credentials`, for example, is not
+   in earthaccess's table).
+3. Use it directly with obstore:
+
+```python
+from obstore.auth.earthdata import NasaEarthdataCredentialProvider
+from obstore.store import S3Store
+
+cp = NasaEarthdataCredentialProvider(credentials_url)
+store = S3Store.from_url(f"s3://{bucket}", credential_provider=cp)
+# or, for fsspec-shaped consumers (zarr, h5py, ...):
+# from obstore.fsspec import FsspecStore
+# fs = FsspecStore("s3", credential_provider=cp)
+```
+
+Credentials auto-refresh per call — no manual renewal needed. Minted keys are
+usable only from AWS **us-west-2** compute; see below.
 
 ## What "requires auth" looks like on the wire
 
@@ -43,11 +79,14 @@ Expect this and explain it well — it's the most common confusing failure:
   before concluding anything.
 - **NASA Earthdata "direct S3"** buckets are only accessible from compute
   *in the same AWS region* (typically us-west-2), using the DAAC's temporary
-  credentials. From anywhere else, expect 403 — tell the user: "this is expected;
-  the S3 URL is valid but designed for in-region use. From here I can assess via
-  the HTTPS (EDL) endpoint; the S3 result would be identical structurally." The
-  scorecard's hosting row still PASSes — restricted-egress hosting is a hosting
-  *model*, not a failure — but record the constraint.
+  credentials. From anywhere else, expect 403 even with valid credentials — this
+  is expected, not a failure. Tell the user: "the S3 URL is valid and credentials
+  minted successfully; access was denied because this request isn't running in
+  us-west-2." The scorecard's hosting row still PASSes — restricted-egress hosting
+  is a hosting *model*, not a failure — but the byte-range/chunking criteria become
+  "not assessed — requires in-region (us-west-2) compute; re-run there with
+  `--credentials-url`". **Never reroute NASA S3 assessment to HTTPS** — bearer-token
+  HTTPS access is for HTTPS *inputs* only, never a substitute for an s3:// input.
 - Region mismatch is also a *performance* finding: if the provider's stated
   audience computes in region X but the bucket lives in region Y, flag it.
 
@@ -73,3 +112,25 @@ report: DNS failure (URL wrong/internal), connect timeout (network path/region
 blocked), 5xx (server side). Don't burn minutes retrying — one clean diagnosis
 beats ten timeouts, and "the endpoint was unreachable from the assessment
 environment" is itself a valid finding with the environment named.
+
+## earthaccess fallback
+
+Used only when the user explicitly opts in (Step 1, option (b)) — never the
+default path. Given a DAAC short name or a known/guessed credentials endpoint:
+
+```python
+import earthaccess
+earthaccess.login()
+fs = earthaccess.get_s3_filesystem(endpoint=credentials_url)  # or daac=daac_short_name
+```
+
+On failure, have the user verify, in order:
+
+1. The DAAC for this dataset.
+2. The `/s3credentials` endpoint (a CMR granule ID resolves this exactly, more
+   reliably than earthaccess's built-in DAAC table — see `resolve_granule.py`).
+3. EDL credentials are actually present (`EARTHDATA_TOKEN`,
+   `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `~/.netrc`).
+
+Never fall back to HTTPS for NASA S3 data if earthaccess fails — the fix is one
+of the three checks above, not a different protocol.

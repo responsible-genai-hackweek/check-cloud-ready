@@ -4,6 +4,7 @@
 Usage:
   python3 compression_bench.py <url> --variable <name>
       [--engine zarr|hdf5] [--anon] [--n-chunks 3] [--keepbits N]
+      [--credentials-url URL] [--granule-id G...-PROVIDER]
 
 Grid: {zstd-1, zstd-3, zstd-5, blosc-lz4, blosc-zstd-3} x {shuffle, noshuffle},
 plus optional bitround (lossy) when --keepbits is given.
@@ -12,27 +13,56 @@ Prints JSON to stdout.
 """
 import argparse
 import json
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nasa_s3
+
+_CLASSIFICATION_HINTS = {
+    "credentials-endpoint-auth": (
+        "EDL credentials missing/invalid — set EARTHDATA_TOKEN, "
+        "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, or ~/.netrc"),
+    "in-region-only": (
+        "credentials minted successfully; S3 denied from this network — "
+        "expected outside us-west-2; re-run in-region"),
+}
 
 
 def note(msg):
     print(msg, file=sys.stderr)
 
 
-def load_sample_chunks(url, variable, engine, anon, n_chunks):
+def _classify_and_annotate(out, exc):
+    """On a credentialed-path auth error, add classification + hint to
+    `out` (mutated in place). Never rewrites to HTTPS."""
+    classification = nasa_s3.classify_s3_error(exc)
+    out["classification"] = classification
+    hint = _CLASSIFICATION_HINTS.get(classification)
+    if hint:
+        out["hint"] = hint
+
+
+def load_sample_chunks(url, variable, engine, anon, n_chunks,
+                       credentials_url=None, granule_id=None):
     """Return a list of contiguous ndarray chunks spread across the array."""
     import numpy as np
-    opts = {"anon": anon} if url.startswith("s3://") else {}
+    if url.startswith("s3://") and (credentials_url or granule_id):
+        fs, path = nasa_s3.get_fs(url, anon=anon, credentials_url=credentials_url,
+                                  granule_id=granule_id)
+    else:
+        import fsspec
+        opts = {"anon": anon} if url.startswith("s3://") else {}
+        fs, path = fsspec.core.url_to_fs(url, **opts)
     if engine == "zarr":
         import zarr
-        g = zarr.open_group(url, mode="r", storage_options=opts or None)
+        g = zarr.open_group(fs.get_mapper(path), mode="r")
         arr = g[variable]
         chunks = arr.chunks
     else:
         import h5py
-        import fsspec
-        f = fsspec.open(url, "rb", **opts).open()
+        f = fs.open(path, "rb")
         h = h5py.File(f, "r")
         arr = h[variable]
         chunks = arr.chunks or tuple(min(s, 256) for s in arr.shape)
@@ -131,13 +161,25 @@ def main():
     ap.add_argument("--n-chunks", type=int, default=3)
     ap.add_argument("--keepbits", type=int, default=None,
                     help="also benchmark lossy bit-rounding with N kept bits")
+    ap.add_argument("--credentials-url", help="DAAC s3credentials endpoint URL")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID, resolved via resolve_granule.py "
+                         "(ignored if --credentials-url is also given)")
     a = ap.parse_args()
+    credentialed = bool(a.credentials_url or a.granule_id)
     try:
         chunks_data = load_sample_chunks(a.url, a.variable, a.engine, a.anon,
-                                         a.n_chunks)
+                                         a.n_chunks, a.credentials_url,
+                                         a.granule_id)
     except ImportError as e:
         sys.exit(f"Missing dependency: {e}. "
                  "pip install zarr h5py fsspec s3fs numcodecs zstandard numpy")
+    except Exception as e:
+        out = {"variable": a.variable, "error": f"{type(e).__name__}: {e}"}
+        if credentialed:
+            _classify_and_annotate(out, e)
+        print(json.dumps(out, indent=2, default=str))
+        return
     if not chunks_data:
         sys.exit("No data sampled - check variable name and URL")
     dtype = chunks_data[0].dtype

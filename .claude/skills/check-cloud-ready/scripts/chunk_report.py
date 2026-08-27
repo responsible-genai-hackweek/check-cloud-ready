@@ -4,6 +4,7 @@
 Usage:
   python3 chunk_report.py <url> [--variables t2m,precip] [--anon]
                           [--engine zarr|h5netcdf|netcdf4] [--samples 8]
+                          [--credentials-url URL] [--granule-id G...-PROVIDER]
 
 For each variable: dtype, shape, chunk shape, chunk count, uncompressed chunk
 size, SAMPLED compressed chunk size (median of N stored chunks), codec pipeline.
@@ -12,12 +13,35 @@ Prints JSON to stdout.
 """
 import argparse
 import json
+import os
 import statistics
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nasa_s3
+
+_CLASSIFICATION_HINTS = {
+    "credentials-endpoint-auth": (
+        "EDL credentials missing/invalid — set EARTHDATA_TOKEN, "
+        "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, or ~/.netrc"),
+    "in-region-only": (
+        "credentials minted successfully; S3 denied from this network — "
+        "expected outside us-west-2; re-run in-region"),
+}
 
 
 def note(msg):
     print(msg, file=sys.stderr)
+
+
+def _classify_and_annotate(out, exc):
+    """On a credentialed-path auth error, add classification + hint to
+    `out` (mutated in place). Never rewrites to HTTPS."""
+    classification = nasa_s3.classify_s3_error(exc)
+    out["classification"] = classification
+    hint = _CLASSIFICATION_HINTS.get(classification)
+    if hint:
+        out["hint"] = hint
 
 
 def grade(compressed_mb):
@@ -34,13 +58,19 @@ def grade(compressed_mb):
     return "WARN (>64 MB)"
 
 
-def zarr_report(url, variables, anon, samples):
-    import zarr
+def _get_fs(url, anon, credentials_url=None, granule_id=None):
+    if url.startswith("s3://") and (credentials_url or granule_id):
+        return nasa_s3.get_fs(url, anon=anon, credentials_url=credentials_url,
+                              granule_id=granule_id)
     import fsspec
     opts = {"anon": anon} if url.startswith("s3://") else {}
-    fs, path = fsspec.core.url_to_fs(url, **opts)
-    store = zarr.open_group(url, mode="r",
-                            storage_options=opts if opts else None)
+    return fsspec.core.url_to_fs(url, **opts)
+
+
+def zarr_report(url, variables, anon, samples, credentials_url=None, granule_id=None):
+    import zarr
+    fs, path = _get_fs(url, anon, credentials_url, granule_id)
+    store = zarr.open_group(fs.get_mapper(path), mode="r")
     out = {"reader": "zarr", "zarr_format": getattr(store, "metadata", None)
            and getattr(store.metadata, "zarr_format", None) or 2}
     arrays = {}
@@ -88,11 +118,10 @@ def sample_zarr_chunk_sizes(fs, path, name, arr, samples):
     return sizes
 
 
-def hdf5_report(url, variables, anon, samples):
+def hdf5_report(url, variables, anon, samples, credentials_url=None, granule_id=None):
     import h5py
-    import fsspec
-    opts = {"anon": anon} if url.startswith("s3://") else {}
-    f = fsspec.open(url, "rb", **opts).open()
+    fs, path = _get_fs(url, anon, credentials_url, granule_id)
+    f = fs.open(path, "rb")
     h = h5py.File(f, "r")
     out = {"reader": "h5py", "variables": {}}
     names = []
@@ -166,8 +195,13 @@ def main():
     ap.add_argument("--samples", type=int, default=8,
                     help="stored chunks to sample per variable")
     ap.add_argument("--engine", choices=["auto", "zarr", "hdf5"], default="auto")
+    ap.add_argument("--credentials-url", help="DAAC s3credentials endpoint URL")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID, resolved via resolve_granule.py "
+                         "(ignored if --credentials-url is also given)")
     a = ap.parse_args()
     variables = a.variables.split(",") if a.variables else None
+    credentialed = bool(a.credentials_url or a.granule_id)
 
     engine = a.engine
     if engine == "auto":
@@ -176,9 +210,11 @@ def main():
         note(f"engine auto-selected: {engine} (override with --engine)")
     try:
         if engine == "zarr":
-            out = zarr_report(a.url, variables, a.anon, a.samples)
+            out = zarr_report(a.url, variables, a.anon, a.samples,
+                              a.credentials_url, a.granule_id)
         else:
-            out = hdf5_report(a.url, variables, a.anon, a.samples)
+            out = hdf5_report(a.url, variables, a.anon, a.samples,
+                              a.credentials_url, a.granule_id)
     except ImportError as e:
         sys.exit(f"Missing dependency: {e}. pip install zarr h5py fsspec s3fs")
     except Exception as e:
@@ -186,6 +222,8 @@ def main():
                "hint": "If auto-detection picked the wrong reader, pass "
                        "--engine zarr|hdf5. NetCDF-3 files have no chunks - "
                        "report that directly rather than running this script."}
+        if credentialed:
+            _classify_and_annotate(out, e)
     print(json.dumps(out, indent=2, default=str))
 
 
