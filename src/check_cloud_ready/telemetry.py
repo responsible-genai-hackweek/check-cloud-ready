@@ -4,24 +4,37 @@ Ported from the earth-science-cloud-readiness skill's smoke_test.py
 (``Budget``/``BudgetExceeded``, ``_CountingFile``/``CountingFS``/
 ``_counting_fs_for``), with two fixes:
 
-S5 (undercounting): the ported ``_CountingFile`` wrapped only
-``read()``. h5py's fileobj driver calls ``readinto()`` exclusively, so
-a 3.3 GB HDF5 file scored "1 request / 0 bytes to open" — a
-measurement bug, not a clean bill of health. Here ``_CountingFile``
-gives its own ``readinto``/``readinto1`` implementations that route
-through its own counted ``read()`` (mirroring
-``fsspec.spec.AbstractBufferedFile.readinto``) instead of delegating
-to the wrapped object's readinto via ``__getattr__``, which would
-bypass counting entirely. This is reliable for both plain ``.open()``
-file objects and fsspec's cache-mediated ``AbstractBufferedFile``
-subclasses: the latter's own ``read()`` always resolves through its
-block cache (``self.cache._fetch`` -> ``self._fetch_range`` on a
-miss) before returning bytes to the caller, so wrapping the outermost
-``read()``/``readinto()`` layer already sees every byte that reaches
-the consumer, cache-mediated or not. ``assert_open_measured`` is the
-exported guard callers use to catch any remaining undercount: a
-"successful" open with zero measured bytes is treated as a bug, never
-as a perfect score.
+S5 (undercounting) has two distinct causes, both fixed here:
+
+1. The ported ``_CountingFile`` wrapped only ``read()``. h5py's fileobj
+   driver calls ``readinto()`` exclusively, so a 3.3 GB HDF5 file
+   scored "1 request / 0 bytes to open" — a measurement bug, not a
+   clean bill of health. ``_CountingFile`` now gives its own
+   ``readinto``/``readinto1`` implementations that route through its
+   own ``read()`` (mirroring ``fsspec.spec.AbstractBufferedFile.
+   readinto``) instead of delegating to the wrapped object's readinto
+   via ``__getattr__``, which would bypass counting entirely.
+2. Even with (1) fixed, counting bytes at the read()/readinto() layer
+   alone still undercounts *wire* bytes for fsspec's cache-mediated
+   ``AbstractBufferedFile`` subclasses (S3File/HTTPFile/...): their
+   ``read()`` returns only the bytes the caller requested, sized to the
+   request, while the default ``cache_type="readahead"`` block cache
+   fetches a whole ``blocksize``-sized (or larger) range over the wire
+   on a cache miss (measured: a single 16 KB ``readinto`` against a
+   1 MB block size pulled ~1 MB over the wire but was being counted as
+   16 KB — a ~65x undercount). ``_CountingFile`` now hooks the wrapped
+   file's ``cache.fetcher`` (fsspec's duck-typed fetch hook,
+   bound to ``_fetch_range``) when present, counting the true wire
+   bytes and one request per actual fetch there instead; the
+   read()/readinto() layer then skips its own byte counting for that
+   file, so bytes are never double-counted at both layers. Plain file
+   objects with no such cache (local files, raw test doubles) have no
+   fetch layer to hook, so they fall back to counting bytes consumed at
+   the read()/readinto() layer, which is exactly correct for them.
+
+``assert_open_measured`` is the exported guard callers use to catch any
+*remaining* undercount down to zero: a "successful" open with zero
+measured bytes is treated as a bug, never as a perfect score.
 
 S8 (wall-clock cap only checked mid-read): the ported ``Budget.spend``
 checked the time cap on every call, but a run with no further reads
@@ -164,25 +177,72 @@ class _CountingFile:
     object's own ``readinto``, a consumer that calls only ``readinto``
     (h5py's fileobj driver) would never touch this class's counted
     ``read`` at all, and bytes would be silently undercounted (S5).
+
+    That alone is not sufficient for fsspec's ``AbstractBufferedFile``
+    subclasses (the S3File/HTTPFile family), because their ``read()``
+    returns bytes sized to the *request*, not to what was actually
+    fetched over the wire: on a cache miss, the default
+    ``cache_type="readahead"`` block cache fetches a whole
+    ``blocksize``-sized (or larger) range via ``self.cache.fetcher``
+    (bound to ``_fetch_range``), and only serves the requested slice
+    back to the caller. Counting at the read()/readinto() layer alone
+    can undercount true wire traffic by up to ~blocksize per miss (a
+    16 KB ``readinto`` against a 1 MB block size measured as a ~65x
+    undercount in practice). So: when the wrapped file exposes a
+    duck-typed ``cache.fetcher`` (the fsspec block-cache pattern), this
+    class hooks that fetcher instead and counts wire bytes + one
+    request per actual fetch; ``read()`` then does *not* also count
+    consumed bytes for that file, to avoid double-counting the same
+    bytes at both layers. For plain file-like objects with no such
+    cache (local files, raw fakes/test doubles), there is no fetch
+    layer to hook, so ``read()`` falls back to counting bytes consumed
+    by the caller, as before — that is exactly correct there, since
+    "consumed" and "fetched" are the same thing for an unbuffered file.
     """
 
     def __init__(self, f, budget: Budget):
         self._f = f
         self._budget = budget
+        self._wire_counted = self._hook_fetch_layer()
+
+    def _hook_fetch_layer(self) -> bool:
+        """Wrap ``f.cache.fetcher`` in place, if present, so every wire
+        fetch adds its true byte count and increments the request
+        counter. Returns True if a fetch layer was found and hooked
+        (meaning ``read()`` must not also count consumed bytes for this
+        file), False if there's no such layer (meaning ``read()``
+        should count consumed bytes as the fallback).
+        """
+        cache = getattr(self._f, "cache", None)
+        fetcher = getattr(cache, "fetcher", None)
+        if fetcher is None or not callable(fetcher):
+            return False
+        budget = self._budget
+
+        def counted_fetcher(start, end, _orig=fetcher):
+            data = _orig(start, end)
+            budget.spend(len(data), 1)
+            return data
+
+        cache.fetcher = counted_fetcher
+        return True
 
     def read(self, *a, **k):
         data = self._f.read(*a, **k)
-        # Each read may or may not correspond to a new network request
-        # (fsspec caches blocks); request counting happens in the FS
-        # proxy (CountingFS), not here. Bytes are counted conservatively
-        # against whatever the caller actually received.
-        self._budget.spend(len(data), 0)
+        if not self._wire_counted:
+            # No fetch layer to hook (plain file object / local file /
+            # test fake): count bytes consumed by the caller, as before.
+            # Each read may or may not correspond to a new network
+            # request; request counting for this fallback path happens
+            # in the FS proxy (CountingFS.open()/cat_file/...), not here.
+            self._budget.spend(len(data), 0)
         return data
 
     def readinto(self, b):
         # Mirrors fsspec.spec.AbstractBufferedFile.readinto: pull bytes
-        # through *this* class's counted read() instead of delegating
-        # to the wrapped object's own readinto.
+        # through *this* class's read() instead of delegating to the
+        # wrapped object's own readinto, so the same counting rules
+        # (fetch-layer or consumed-bytes fallback) always apply.
         out = memoryview(b).cast("B")
         data = self.read(len(out))
         n = len(data)

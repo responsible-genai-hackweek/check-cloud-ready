@@ -1,4 +1,4 @@
-"""Offline tests for check_cloud_ready.budget.
+"""Offline tests for check_cloud_ready.telemetry.
 
 No network access. All filesystem/file objects are fakes built in-test.
 Budget is given an injectable clock so time-cap behavior is testable
@@ -6,17 +6,19 @@ without sleeping.
 """
 import unittest
 
-from check_cloud_ready import budget as budget_mod
+from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 
-Budget = budget_mod.Budget
-BudgetExceeded = budget_mod.BudgetExceeded
-MeasurementError = budget_mod.MeasurementError
-CountingFS = budget_mod.CountingFS
-counting_fs = budget_mod.counting_fs
-assert_open_measured = budget_mod.assert_open_measured
-BYTE_CAP = budget_mod.BYTE_CAP
-TIME_CAP = budget_mod.TIME_CAP
-HEADER_READ = budget_mod.HEADER_READ
+from check_cloud_ready import telemetry as telemetry_mod
+
+Budget = telemetry_mod.Budget
+BudgetExceeded = telemetry_mod.BudgetExceeded
+MeasurementError = telemetry_mod.MeasurementError
+CountingFS = telemetry_mod.CountingFS
+counting_fs = telemetry_mod.counting_fs
+assert_open_measured = telemetry_mod.assert_open_measured
+BYTE_CAP = telemetry_mod.BYTE_CAP
+TIME_CAP = telemetry_mod.TIME_CAP
+HEADER_READ = telemetry_mod.HEADER_READ
 
 
 class FakeClock:
@@ -66,18 +68,64 @@ class FakeFS:
     cat_file for the requests-per-call assertions.
     """
 
-    def __init__(self, files):
+    def __init__(self, files, file_cls=ReadOnlyFile):
         self.files = files
+        self.file_cls = file_cls
         self.open_calls = 0
         self.cat_calls = 0
 
     def open(self, path, mode="rb", **kwargs):
         self.open_calls += 1
-        return ReadOnlyFile(self.files[path])
+        return self.file_cls(self.files[path])
 
     def cat_file(self, path):
         self.cat_calls += 1
         return self.files[path]
+
+
+class InstrumentedFetchFile(AbstractBufferedFile):
+    """A real fsspec ``AbstractBufferedFile`` subclass whose
+    ``_fetch_range`` is instrumented to record exactly how many bytes
+    crossed the "wire" in place of a real network call. This exercises
+    fsspec's actual cache-mediated code path — ``cache_type="readahead"``
+    is fsspec's own default — rather than a fake with no cache at all,
+    so it reproduces the S5 wire-byte undercount for real.
+    """
+
+    def __init__(self, fs, path, wire_log, data=b"", mode="rb",
+                 block_size=None, cache_type="readahead", **kwargs):
+        self._data = data
+        self._wire_log = wire_log
+        super().__init__(fs, path, mode=mode, block_size=block_size,
+                          cache_type=cache_type, size=len(data), **kwargs)
+
+    def _fetch_range(self, start, end):
+        chunk = self._data[start:end]
+        self._wire_log.append(len(chunk))
+        return chunk
+
+
+class InstrumentedFetchFS(AbstractFileSystem):
+    """Minimal real ``AbstractFileSystem`` whose ``open()`` returns an
+    ``InstrumentedFetchFile``, so its cache/fetcher machinery is the
+    genuine fsspec implementation, not a hand-rolled stand-in."""
+
+    protocol = "instrumented-test"
+
+    def __init__(self, data, wire_log):
+        super().__init__()
+        self._data = data
+        self._wire_log = wire_log
+
+    def _open(self, path, mode="rb", block_size=None,
+              cache_type="readahead", **kwargs):
+        return InstrumentedFetchFile(
+            self, path, wire_log=self._wire_log, data=self._data,
+            mode=mode, block_size=block_size, cache_type=cache_type,
+            **kwargs)
+
+    def info(self, path, **kwargs):
+        return {"name": path, "size": len(self._data), "type": "file"}
 
 
 class BudgetSpendTests(unittest.TestCase):
@@ -187,7 +235,7 @@ class CountingFileReadTests(unittest.TestCase):
         consumer scored 0 bytes even after real reads happened.
         """
         b = Budget()
-        fs = FakeFS({"/a": b"y" * 1000})
+        fs = FakeFS({"/a": b"y" * 1000}, file_cls=ReadIntoOnlyConsumerFile)
         cfs = counting_fs(fs, budget=b)
         f = cfs.open("/a", "rb")
 
@@ -217,6 +265,69 @@ class CountingFileReadTests(unittest.TestCase):
         for _ in range(3):
             f.readinto(buf)
         self.assertEqual(b.bytes, 300)
+
+
+class WireByteFetchLayerTests(unittest.TestCase):
+    """S5 (part 2): counting at the read()/readinto() layer alone still
+    undercounts *wire* bytes for fsspec's cache-mediated
+    AbstractBufferedFile subclasses, because a small request can
+    trigger a much larger block fetch on a cache miss (the default
+    cache_type is "readahead"). _CountingFile must hook the cache's
+    fetcher and count what actually crossed the wire, not just what
+    the caller consumed — and must not double-count when it does.
+    """
+
+    def test_readinto_counts_wire_bytes_not_just_consumed_bytes(self):
+        data = b"Q" * (5 * 1024 * 1024)
+        wire_log = []
+        fs = InstrumentedFetchFS(data, wire_log)
+        b = Budget()
+        cfs = counting_fs(fs, budget=b)
+        f = cfs.open("/x", "rb", block_size=1024 * 1024, cache_type="readahead")
+
+        buf = bytearray(16384)
+        n = f.readinto(buf)
+
+        self.assertEqual(n, 16384)  # consumer still gets what it asked for
+        wire_bytes = sum(wire_log)
+        self.assertGreater(wire_bytes, 16384)  # block cache over-fetched
+        self.assertEqual(b.bytes, wire_bytes)  # Budget tracks the wire cost,
+                                                # not the smaller consumed count
+        # 1 request for the open() call itself, plus 1 per real wire fetch.
+        self.assertEqual(b.requests, 1 + len(wire_log))
+
+    def test_second_read_within_cached_block_adds_no_new_request(self):
+        """A second small read served entirely from the already-fetched
+        block must not trigger another wire fetch/request."""
+        data = b"R" * (5 * 1024 * 1024)
+        wire_log = []
+        fs = InstrumentedFetchFS(data, wire_log)
+        b = Budget()
+        cfs = counting_fs(fs, budget=b)
+        f = cfs.open("/x", "rb", block_size=1024 * 1024, cache_type="readahead")
+
+        f.readinto(bytearray(1024))
+        bytes_after_first, requests_after_first = b.bytes, b.requests
+        f.readinto(bytearray(1024))  # still within the same cached block
+
+        self.assertEqual(b.requests, requests_after_first)  # no new wire fetch
+        self.assertEqual(b.bytes, bytes_after_first)  # no new bytes counted
+        self.assertEqual(len(wire_log), 1)  # confirm: fsspec really did serve
+                                             # this from cache, not a new fetch
+
+    def test_plain_file_without_fetch_layer_is_not_double_counted(self):
+        """Files with no cache/fetcher (plain file-like objects, e.g.
+        local files or the fakes used elsewhere in this module) fall
+        back to counting consumed bytes exactly once — not missed
+        (zero) and not doubled (counted at both layers).
+        """
+        b = Budget()
+        fs = FakeFS({"/a": b"p" * 1000})
+        cfs = counting_fs(fs, budget=b)
+        f = cfs.open("/a", "rb")
+        f.read(100)
+        f.readinto(bytearray(50))
+        self.assertEqual(b.bytes, 150)
 
 
 class RequestCountingTests(unittest.TestCase):
