@@ -85,7 +85,7 @@ confidence downgraded.
 | Check | Pts | Pass criteria |
 |---|---|---|
 | D1 Range requests | 6 | Real Range request answered with 206 + correct byte count; `Accept-Ranges: bytes`. |
-| D2 Auth & transparency | 3 | Anonymous access, or auth clearly documented; requester-pays flagged. |
+| D2 Auth & transparency | 3 | Anonymous access, or auth clearly documented; requester-pays flagged. NASA Earthdata in-region-only S3 whose `/s3credentials` endpoint is documented in CMR (resolvable from a granule ID) counts as "auth clearly documented" — the out-of-region 403 is expected, not a transparency failure. |
 | D3 HTTPS & CORS | 3 | HTTPS with valid TLS; CORS headers if browser use is plausible. |
 | D4 Clean data path | 3 | No redirect chains, HTML interstitials, or click-through pages in front of data URLs; region/endpoint documented. |
 

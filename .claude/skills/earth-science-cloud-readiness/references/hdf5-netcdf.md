@@ -36,8 +36,18 @@ HDF5/NetCDF-4 is "cloud-optimizable":
   absent): walk datasets, record `chunks`, dtype, shape, filters,
   and file-space strategy/page size where the API exposes it.
 - Tiny subset: read one chunk of one dataset; record TTFB/throughput.
-- If auth-gated (e.g., Earthdata login) and no credentials: smoke test
-  SKIPPED with reason `auth`, confidence downgraded.
+- Auth-gated files (e.g. NASA Earthdata Cloud) have three outcomes — never
+  a FAIL, and never a reroute to the HTTPS URL:
+  1. **Credentialed open** — a CMR granule ID or `/s3credentials` endpoint
+     was supplied, so `smoke_test.py` mints credentials via obstore and reads
+     the object directly over S3 (`transport: "s3-authenticated"`). Assessed
+     normally, full confidence.
+  2. **`nasa-credentials-required`** — protected NASA `s3://` URL with no
+     granule ID / credentials endpoint: SKIPPED, confidence downgraded, and
+     the report says which flag to re-run with.
+  3. **`in-region-only`** — credentials minted, but S3 denied the read from
+     outside `us-west-2`: SKIPPED, confidence downgraded; hosting itself is
+     not penalized. Re-run from in-region compute for live evidence.
 
 ## Common remediations
 

@@ -13,8 +13,16 @@ Per asset, with hard caps (~25 MB total transfer, 60 s):
 
 All probes are ranged and byte-capped; whole files are never downloaded.
 
+NASA Earthdata S3 (`s3://` on a protected DAAC bucket) is read with
+credentials minted from the DAAC's `/s3credentials` endpoint (see
+`nasa_s3.py`); it is never rerouted to a public HTTPS URL. Without a
+credentials endpoint (or a CMR granule ID that resolves one) the asset is
+SKIPPED, never FAILED.
+
 Usage (standalone):
     python smoke_test.py <url> [--format cog|zarr|hdf5|parquet|...]
+                               [--credentials-url URL | --granule-id G...-PROV]
+                               [--earthaccess-fallback]
 Importable API:
     run_smoke_test(url, fmt, budget=None) -> dict
 """
@@ -22,11 +30,17 @@ Importable API:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import argparse
 from urllib.parse import urlparse
 import builtins
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nasa_s3  # noqa: E402
+import resolve_granule  # noqa: E402
+
 
 # ---------------------------------------------------------------- optional deps
 def _try(name):
@@ -37,7 +51,6 @@ def _try(name):
 
 httpx = _try("httpx")
 fsspec = _try("fsspec")
-earthaccess = _try("earthaccess")
 rasterio = _try("rasterio")
 zarr = _try("zarr")
 xr = _try("xarray")
@@ -151,12 +164,42 @@ class Budget:
                 "elapsed_s": round(time.monotonic() - self.t0, 3)}
 
 
+# -------------------------------------------------------------- skip reasons
+# Auth/region problems are always SKIPPED (never FAILED): the dataset is not
+# graded down, the report's confidence label is.
+NASA_CREDENTIALS_REQUIRED_REASON = (
+    "nasa-credentials-required: pass --granule-id or --credentials-url "
+    "(recommended), or --earthaccess-fallback")
+IN_REGION_ONLY_REASON = (
+    "in-region-only: credentials minted successfully but S3 denied from this "
+    "network (expected outside us-west-2)")
+CREDENTIALS_AUTH_REASON = (
+    "auth: EDL credentials missing/invalid (check EARTHDATA_TOKEN / "
+    "EARTHDATA_USERNAME+PASSWORD / ~/.netrc)")
+
+_AUTH_SKIP_REASONS = {
+    "in-region-only": IN_REGION_ONLY_REASON,
+    "credentials-endpoint-auth": CREDENTIALS_AUTH_REASON,
+}
+
+
+def _s3_auth_skip_reason(exc):
+    """Map an exception raised on the credentialed S3 path to a SKIPPED
+    reason string, or None if it isn't an auth/region problem."""
+    return _AUTH_SKIP_REASONS.get(nasa_s3.classify_s3_error(exc))
+
+
 # ---------------------------------------------------------------- HTTP probes
-_NISAR_AUTH_FS = None  # Cache authenticated S3 filesystem for NISAR
+# Authenticated NASA filesystems, keyed by credentials endpoint. nasa_s3.get_fs
+# stays pure; this cache just avoids re-minting credentials per asset.
+_AUTH_FS_CACHE: dict = {}
+
 
 def _to_https(url: str) -> str:
     """Best-effort conversion of s3://, gs://, az:// to a probe-able HTTPS URL.
-    Region-specific endpoints may be needed; failures are reported, not fatal."""
+    Region-specific endpoints may be needed; failures are reported, not fatal.
+    NEVER used for NASA Earthdata s3:// URLs — those are read through the
+    credentialed S3 path or skipped."""
     p = urlparse(url)
     if p.scheme == "s3":
         return f"https://{p.netloc}.s3.amazonaws.com{p.path}"
@@ -167,7 +210,7 @@ def _to_https(url: str) -> str:
     return url
 
 
-def head_probe(url: str, budget: Budget) -> dict:
+def head_probe(url: str, budget: Budget, headers=None) -> dict:
     out = {"check": "HEAD", "url": url}
     if httpx is None:
         out.update(status="skipped", reason="httpx not installed")
@@ -175,7 +218,7 @@ def head_probe(url: str, budget: Budget) -> dict:
     try:
         with httpx.Client(follow_redirects=True, timeout=15, verify=True) as c:
             t0 = time.monotonic()
-            r = c.head(url)
+            r = c.head(url, headers=headers or None)
             budget.spend(0, 1)
             out.update(
                 status="pass" if r.status_code < 400 else "fail",
@@ -199,12 +242,8 @@ def head_probe(url: str, budget: Budget) -> dict:
     return out
 
 
-def ranged_probe(url: str, budget: Budget, content_length=None) -> dict:
-    """First 16 KB + one interior range; verify 206 + correct byte counts."""
-    out = {"check": "ranged_reads", "reads": []}
-    if httpx is None:
-        out.update(status="skipped", reason="httpx not installed")
-        return out
+def _probe_ranges(content_length=None):
+    """First 16 KB + (if the object is big enough) one interior range."""
     ranges = [(0, HEADER_READ - 1)]
     try:
         cl = int(content_length) if content_length else None
@@ -213,13 +252,25 @@ def ranged_probe(url: str, budget: Budget, content_length=None) -> dict:
     if cl and cl > HEADER_READ * 4:
         mid = cl // 2
         ranges.append((mid, min(mid + HEADER_READ - 1, cl - 1)))
+    return ranges
+
+
+def ranged_probe(url: str, budget: Budget, content_length=None,
+                 headers=None) -> dict:
+    """First 16 KB + one interior range; verify 206 + correct byte counts."""
+    out = {"check": "ranged_reads", "reads": []}
+    if httpx is None:
+        out.update(status="skipped", reason="httpx not installed")
+        return out
+    ranges = _probe_ranges(content_length)
     status = "pass"
     first_bytes = b""
     try:
         with httpx.Client(follow_redirects=True, timeout=15) as c:
             for (a, b) in ranges:
                 t0 = time.monotonic()
-                r = c.get(url, headers={"Range": f"bytes={a}-{b}"})
+                r = c.get(url, headers={**(headers or {}),
+                                        "Range": f"bytes={a}-{b}"})
                 got = len(r.content)
                 budget.spend(got, 1)
                 ok = r.status_code == 206 and got == (b - a + 1)
@@ -242,6 +293,58 @@ def ranged_probe(url: str, budget: Budget, content_length=None) -> dict:
         raise
     except Exception as e:
         out.update(status="skipped", reason=f"network: {type(e).__name__}: {e}")
+    return out
+
+
+# ------------------------------------------- authenticated S3 probes (no HTTPS)
+def fs_head_probe(cfs, path: str, budget: Budget) -> dict:
+    """HEAD-equivalent over an authenticated filesystem (`fs.info`). Same
+    telemetry field names as head_probe so assess.py needs no special case.
+    Raises on auth/region failure; the caller classifies it."""
+    out = {"check": "HEAD", "url": path, "transport": "s3-authenticated"}
+    t0 = time.monotonic()
+    info = cfs.info(path) or {}
+    size = info.get("size", info.get("Size", info.get("ContentLength")))
+    etag = info.get("ETag", info.get("etag", info.get("e_tag")))
+    out.update(
+        status="pass",
+        content_length=size,
+        # S3 GetObject always honours Range; TLS is enforced by the SDK.
+        accept_ranges="bytes",
+        etag=etag,
+        content_type=info.get("ContentType", info.get("type")),
+        cors_allow_origin=None,
+        redirects=0,
+        final_url=path,
+        tls_ok=True,
+        latency_ms=round((time.monotonic() - t0) * 1000, 1),
+    )
+    return out
+
+
+def fs_ranged_probe(cfs, path: str, budget: Budget, content_length=None) -> dict:
+    """Ranged reads over an authenticated filesystem (`fs.cat_file`). Emits
+    the same field names as ranged_probe (`reads`, `first_bytes_hex`,
+    `first_bytes`) so format sniffing works identically."""
+    out = {"check": "ranged_reads", "reads": [], "transport": "s3-authenticated"}
+    ranges = _probe_ranges(content_length)
+    status = "pass"
+    first_bytes = b""
+    for (a, b) in ranges:
+        t0 = time.monotonic()
+        data = cfs.cat_file(path, start=a, end=b + 1)  # end is exclusive
+        got = len(data)
+        ok = got == (b - a + 1)
+        out["reads"].append({
+            "range": f"{a}-{b}", "bytes": got, "expected": b - a + 1, "ok": ok,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1)})
+        if not ok:
+            status = "fail"
+        if a == 0:
+            first_bytes = data[:64]
+    out["status"] = status
+    out["first_bytes_hex"] = first_bytes[:16].hex()
+    out["first_bytes"] = first_bytes
     return out
 
 
@@ -307,8 +410,15 @@ class CountingFS:
         return wrapper
 
 
-def _counting_fs_for(url: str, budget: Budget, no_network=False):
-    global _NISAR_AUTH_FS
+NASA_CREDENTIALS_REQUIRED = "nasa-credentials-required"
+
+
+def _counting_fs_for(url: str, budget: Budget, no_network=False,
+                     credentials_url=None, earthaccess_fallback=False):
+    """Return (CountingFS, path), (None, None) when no filesystem applies, or
+    the sentinel (None, NASA_CREDENTIALS_REQUIRED) when the URL is NASA
+    Earthdata S3 and no credentials were supplied. Credential minting is never
+    attempted implicitly."""
     if fsspec is None or no_network:
         return None, None
     p = urlparse(url)
@@ -317,24 +427,19 @@ def _counting_fs_for(url: str, budget: Budget, no_network=False):
         fs = fsspec.filesystem("http")
         path = url
     elif proto == "s3":
-        fs = None
-        # Try earthaccess for NASA endpoints (e.g., NISAR)
-        if earthaccess is not None and ("nisar" in url.lower() or "daac" in url.lower() or "earthdatacloud" in url.lower()):
-            try:
-                # Reuse cached filesystem if already authenticated
-                if _NISAR_AUTH_FS is None:
-                    auth = earthaccess.login(strategy="all", persist=True)
-                    if auth:
-                        endpoint = 'https://nisar.asf.earthdatacloud.nasa.gov/s3credentials'
-                        _NISAR_AUTH_FS = earthaccess.get_s3_filesystem(endpoint=endpoint)
-                        print(f"[smoke_test] Authenticated to NISAR via earthaccess", file=sys.stderr)
-                fs = _NISAR_AUTH_FS
-            except Exception as e:
-                print(f"[smoke_test] earthaccess auth failed ({e}); using anonymous S3", file=sys.stderr)
-                fs = None
-
-        # Fallback to anonymous S3 access
-        if fs is None:
+        if credentials_url:
+            fs = _AUTH_FS_CACHE.get(credentials_url)
+            if fs is None:
+                fs, _ = nasa_s3.get_fs(url, credentials_url=credentials_url)
+                _AUTH_FS_CACHE[credentials_url] = fs
+        elif earthaccess_fallback:
+            fs, _ = nasa_s3.get_fs(url, earthaccess_fallback=True,
+                                   credentials_url=credentials_url)
+        elif nasa_s3.looks_like_nasa_earthdata(url):
+            # Protected NASA bucket: never guess, never fall through to an
+            # anonymous read that would 403 with a mystery reason.
+            return None, NASA_CREDENTIALS_REQUIRED
+        else:
             fs = fsspec.filesystem("s3", anon=True)
         path = url
     elif proto == "gs":
@@ -413,11 +518,10 @@ def _open_cog(url, budget, tel):
                                     "reason": "rio-cogeo not installed"}
 
 
-def _open_zarr(url, budget, tel, no_network=False, variables=None):
+def _open_zarr(url, budget, tel, cfs=None, path=None, variables=None):
     if zarr is None and xr is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "zarr/xarray not installed"}
         return
-    cfs, path = _counting_fs_for(url, budget, no_network)
     if cfs is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "no fsspec filesystem for scheme"}
         return
@@ -490,11 +594,10 @@ def _open_zarr(url, budget, tel, no_network=False, variables=None):
                             "requests_before_failure": budget.requests - req0}
 
 
-def _open_hdf5(url, budget, tel, no_network=False, variables=None):
+def _open_hdf5(url, budget, tel, cfs=None, path=None, variables=None):
     if h5py is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "h5py not installed"}
         return
-    cfs, path = _counting_fs_for(url, budget, no_network)
     if cfs is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "no fsspec filesystem for scheme"}
         return
@@ -562,11 +665,10 @@ def _open_hdf5(url, budget, tel, no_network=False, variables=None):
                             "requests_before_failure": budget.requests - req0}
 
 
-def _open_parquet(url, budget, tel, no_network=False, variables=None):
+def _open_parquet(url, budget, tel, cfs=None, path=None, variables=None):
     if papq is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "pyarrow not installed"}
         return
-    cfs, path = _counting_fs_for(url, budget, no_network)
     if cfs is None:
         tel["lazy_open"] = {"status": "skipped", "reason": "no fsspec filesystem for scheme"}
         return
@@ -635,38 +737,158 @@ _OPENERS = {
 
 
 # ------------------------------------------------------------------ main entry
+def _https_probe_with_bearer(probe_url, budget, tel):
+    """HEAD (+ one EDL-bearer retry for protected HTTPS inputs). Returns the
+    Authorization headers to reuse for the ranged probe, or None."""
+    tel["head"] = head_probe(probe_url, budget)
+    h = tel["head"]
+    edl_redirect = nasa_s3.EDL_HOST in str(h.get("final_url") or "")
+    if not (h.get("http_status") in (401, 403) or edl_redirect):
+        return None
+    token = nasa_s3.edl_bearer_token()
+    if not token:
+        h["bearer_retry"] = ("skipped: no Earthdata Login token available "
+                             "(set EARTHDATA_TOKEN, EARTHDATA_USERNAME/"
+                             "EARTHDATA_PASSWORD, or ~/.netrc)")
+        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    retry = head_probe(probe_url, budget, headers=headers)
+    retry["bearer_auth"] = True
+    tel["head"] = retry
+    return headers if retry.get("status") == "pass" else None
+
+
+def _ranged_auth_recovery(probe_url, budget, ranged, content_length, headers):
+    """Some protected HTTPS endpoints answer HEAD but 401 the ranged GET.
+    Retry once with an EDL bearer token; if it still fails, the reads are
+    auth-blocked — SKIPPED, never FAILED."""
+    def auth_blocked(r):
+        return bool({rd.get("http_status") for rd in r.get("reads") or []}
+                    & {401, 403})
+
+    if not auth_blocked(ranged):
+        return ranged
+    if headers is None:
+        token = nasa_s3.edl_bearer_token()
+        if token:
+            retry = ranged_probe(probe_url, budget, content_length,
+                                 headers={"Authorization": f"Bearer {token}"})
+            retry["bearer_auth"] = True
+            ranged = retry
+            if not auth_blocked(ranged):
+                return ranged
+        else:
+            ranged["bearer_retry"] = ("skipped: no Earthdata Login token "
+                                      "available (set EARTHDATA_TOKEN, "
+                                      "EARTHDATA_USERNAME/EARTHDATA_PASSWORD, "
+                                      "or ~/.netrc)")
+    ranged["status"] = "skipped"
+    ranged["auth_blocked"] = True
+    ranged["reason"] = CREDENTIALS_AUTH_REASON
+    return ranged
+
+
 def run_smoke_test(url: str, fmt: str = "", no_network: bool = False,
-                   variables=None) -> dict:
+                   variables=None, credentials_url=None,
+                   earthaccess_fallback: bool = False) -> dict:
     """Run the full bounded smoke test for one asset. Never raises for
     network problems; returns status pass|fail|skipped with telemetry."""
     budget = Budget()
     tel = {"url": url, "format": fmt, "caps": {"bytes": BYTE_CAP, "seconds": TIME_CAP}}
-    probe_url = _to_https(url) if urlparse(url).scheme in ("s3", "gs") else url
-    is_remote = urlparse(probe_url).scheme in ("http", "https")
+    scheme = urlparse(url).scheme
+    # A credentialed NASA S3 read is a first-class transport: never rewritten
+    # to a public HTTPS URL (that HEAD would 403 and mask the real result).
+    credentialed_s3 = scheme == "s3" and bool(credentials_url or earthaccess_fallback)
 
     if no_network:
         tel.update(status="skipped", reason="network disabled (--no-network)",
                    budget=budget.snapshot())
         return tel
 
+    if (scheme == "s3" and not credentialed_s3
+            and nasa_s3.looks_like_nasa_earthdata(url)):
+        tel.update(status="skipped", reason=NASA_CREDENTIALS_REQUIRED_REASON,
+                   budget=budget.snapshot())
+        return tel
+
+    probe_url = url if credentialed_s3 else (
+        _to_https(url) if scheme in ("s3", "gs") else url)
+    is_remote = not credentialed_s3 and urlparse(probe_url).scheme in ("http", "https")
+
+    cfs = path = None
     try:
-        if is_remote:
-            tel["head"] = head_probe(probe_url, budget)
+        if credentialed_s3:
+            try:
+                cfs, path = _counting_fs_for(
+                    url, budget, no_network, credentials_url=credentials_url,
+                    earthaccess_fallback=earthaccess_fallback)
+                if cfs is None:
+                    tel.update(status="skipped",
+                               reason="fsspec not installed; cannot read "
+                                      "authenticated NASA S3",
+                               budget=budget.snapshot())
+                    return tel
+                if fmt not in ("zarr", "icechunk"):  # store roots aren't objects
+                    tel["head"] = fs_head_probe(cfs, path, budget)
+                    tel["ranged"] = fs_ranged_probe(
+                        cfs, path, budget, tel["head"].get("content_length"))
+                    tel["ranged"].pop("first_bytes", None)
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                reason = _s3_auth_skip_reason(e)
+                tel.update(
+                    status="skipped",
+                    reason=reason or f"s3-authenticated: {type(e).__name__}: {e}",
+                    budget=budget.snapshot())
+                return tel
+        elif is_remote:
+            headers = None
+            if scheme in ("http", "https"):
+                # Bearer auth is for HTTPS inputs only — never a stand-in for
+                # credentials on an s3:// input.
+                headers = _https_probe_with_bearer(probe_url, budget, tel)
+            else:
+                tel["head"] = head_probe(probe_url, budget)
             if tel["head"].get("status") == "skipped":
                 tel.update(status="skipped", reason=tel["head"].get("reason"),
                            budget=budget.snapshot())
                 return tel
             if fmt not in ("zarr", "icechunk"):  # store roots aren't single objects
-                tel["ranged"] = ranged_probe(probe_url, budget,
-                                             tel["head"].get("content_length"))
+                content_length = tel["head"].get("content_length")
+                tel["ranged"] = ranged_probe(probe_url, budget, content_length,
+                                             headers=headers)
+                if scheme in ("http", "https"):
+                    tel["ranged"] = _ranged_auth_recovery(
+                        probe_url, budget, tel["ranged"], content_length, headers)
                 tel["ranged"].pop("first_bytes", None)
+                if tel["ranged"].get("auth_blocked"):
+                    tel.update(status="skipped", reason=tel["ranged"]["reason"],
+                               budget=budget.snapshot())
+                    return tel
         opener = _OPENERS.get(fmt)
         if opener is not None:
             if opener is _open_cog:
-                opener(url if urlparse(url).scheme not in ("s3", "gs") else probe_url,
-                       budget, tel)
+                if credentialed_s3:
+                    tel["lazy_open"] = {
+                        "status": "skipped",
+                        "reason": "GDAL cannot use the minted NASA credential "
+                                  "provider; re-run in-region with AWS "
+                                  "credentials exported for a COG open"}
+                else:
+                    opener(url if scheme not in ("s3", "gs") else probe_url,
+                           budget, tel)
             else:
-                opener(url, budget, tel, no_network=no_network, variables=variables)
+                if cfs is None:
+                    cfs, path = _counting_fs_for(
+                        url, budget, no_network, credentials_url=credentials_url,
+                        earthaccess_fallback=earthaccess_fallback)
+                    if path == NASA_CREDENTIALS_REQUIRED:  # pragma: no cover
+                        tel.update(status="skipped",
+                                   reason=NASA_CREDENTIALS_REQUIRED_REASON,
+                                   budget=budget.snapshot())
+                        return tel
+                opener(url, budget, tel, cfs, path, variables=variables)
         else:
             tel["lazy_open"] = {"status": "n/a", "open_supported": False,
                                 "reason": f"no remote-open path for format {fmt!r} "
@@ -678,9 +900,17 @@ def run_smoke_test(url: str, fmt: str = "", no_network: bool = False,
             or tel.get("format_validation", {}).get("valid") is False
         )
         lazy = tel.get("lazy_open", {}).get("status")
-        if hard_fail:
+        lazy_reason = str(tel.get("lazy_open", {}).get("reason", ""))
+        # Auth/region failures surfaced by the opener (e.g. a Zarr store root,
+        # where there is no single object to HEAD first) are SKIPPED, not FAIL.
+        auth_reason = (_s3_auth_skip_reason(Exception(lazy_reason))
+                       if credentialed_s3 and lazy == "skipped" else None)
+        if auth_reason:
+            tel["status"] = "skipped"
+            tel["reason"] = auth_reason
+        elif hard_fail:
             tel["status"] = "fail"
-        elif lazy == "skipped" and "network" in str(tel.get("lazy_open", {}).get("reason", "")):
+        elif lazy == "skipped" and "network" in lazy_reason:
             tel["status"] = "skipped"
             tel["reason"] = tel["lazy_open"]["reason"]
         else:
@@ -695,13 +925,45 @@ def run_smoke_test(url: str, fmt: str = "", no_network: bool = False,
     return tel
 
 
+def resolve_credentials_url(credentials_url=None, granule_id=None):
+    """--credentials-url wins; otherwise resolve a CMR granule ID to its
+    DAAC s3credentials endpoint. Never raises: an unresolvable granule leaves
+    the credentials endpoint unset (the asset is then SKIPPED, not FAILED)."""
+    if credentials_url:
+        return credentials_url
+    if not granule_id:
+        return None
+    try:
+        resolved = resolve_granule.resolve(granule_id).get("credentials_url")
+    except SystemExit as e:  # resolve() is CLI-style: sys.exit(msg)
+        print(f"[smoke_test] granule resolution failed: {e}", file=sys.stderr)
+        return None
+    if not resolved:
+        print(f"[smoke_test] granule {granule_id} has no s3credentials "
+              "endpoint in CMR", file=sys.stderr)
+    return resolved
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("url")
     ap.add_argument("--format", default="", help="cog|zarr|hdf5|parquet|...")
     ap.add_argument("--no-network", action="store_true")
+    ap.add_argument("--credentials-url",
+                    help="DAAC s3credentials endpoint for NASA Earthdata S3 "
+                         "(wins over --granule-id)")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID (e.g. G4289749526-ASF); "
+                         "resolved to a credentials endpoint via CMR")
+    ap.add_argument("--earthaccess-fallback", action="store_true",
+                    help="opt-in earthaccess credential fallback (never "
+                         "used implicitly)")
     args = ap.parse_args()
-    print(json.dumps(run_smoke_test(args.url, args.format, args.no_network),
+    credentials_url = resolve_credentials_url(args.credentials_url,
+                                              args.granule_id)
+    print(json.dumps(run_smoke_test(args.url, args.format, args.no_network,
+                                    credentials_url=credentials_url,
+                                    earthaccess_fallback=args.earthaccess_fallback),
                      indent=2, default=str))
 
 

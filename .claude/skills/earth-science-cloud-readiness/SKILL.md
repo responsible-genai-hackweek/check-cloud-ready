@@ -57,21 +57,46 @@ architectures, or cost — even if asked in the same breath.
    - Chunking targets & sizing math (always, for Dimension C) → `references/chunking-for-ai.md`
    - Interpreting compression trials / writing C5 remediations → `references/compression.md`
    - Croissant/GeoCroissant input or `--emit-croissant` → `references/croissant.md`
-5. **Run the assessment**:
+5. **NASA Earthdata data — ask before assessing.** If any asset is a NASA
+   Earthdata `s3://` URL (heuristic: `scripts/nasa_s3.py`
+   `looks_like_nasa_earthdata`) and you do NOT already know a CMR granule ID
+   or an s3credentials endpoint, ask the user **before** running `assess.py`
+   (options, best first):
+   - **a CMR granule concept ID** (e.g. `G4289749526-ASF`) — recommended;
+     `scripts/resolve_granule.py` turns it into the exact per-DAAC
+     s3credentials endpoint plus the granule's `s3://` URLs. Pass it as the
+     input itself, or as `--granule-id` alongside another input.
+   - **the DAAC's `/s3credentials` endpoint** directly (`--credentials-url`).
+   - **a guess from `KNOWN_CREDENTIALS_ENDPOINTS`** in `scripts/nasa_s3.py`,
+     confirmed by the user before use.
+   - **the earthaccess fallback** (`--earthaccess-fallback`) — opt-in only,
+     never invoked implicitly.
+
+   This mirrors the canonical decision flow in the repo-root
+   `auth-workflow.md`. Never substitute an HTTPS URL for a NASA `s3://` URL:
+   without credentials the asset is SKIPPED, not FAILED, and not silently
+   re-probed over HTTPS. Credentials come from the environment
+   (`EARTHDATA_TOKEN`, `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or
+   `~/.netrc`) — never ask for or paste secrets into the conversation.
+6. **Run the assessment**:
    ```bash
    python scripts/assess.py <INPUT> --workdir ./assessment \
        [--variables v1,v2] [--profile interactive|training|agentic] \
-       [--max-assets N] [--all] [--emit-croissant] [--no-network]
+       [--max-assets N] [--all] [--emit-croissant] [--no-network] \
+       [--granule-id G...-PROVIDER] [--credentials-url URL] \
+       [--earthaccess-fallback]
    ```
    `assess.py` detects the input, crawls/samples, dispatches format
    assessors, invokes `smoke_test.py` per sampled asset, scores against the
-   rubric, and writes `findings.json`.
-6. **Render the report**:
+   rubric, and writes `findings.json`. `<INPUT>` may itself be a CMR granule
+   ID, in which case the credentials endpoint and the granule's `s3://` URLs
+   are resolved from CMR automatically (`--credentials-url` still wins).
+7. **Render the report**:
    ```bash
    python scripts/report.py ./assessment/findings.json \
        --template assets/report-template.md -o ./assessment/assessment-report.md
    ```
-7. **Review and hand over**: read the generated report, verify every failed
+8. **Review and hand over**: read the generated report, verify every failed
    check has a remediation, verify the three-profile chunking table is
    present (mandatory even for A-tier), then present both files to the user
    with a one-paragraph verdict in the conversation.
@@ -83,6 +108,7 @@ architectures, or cost — even if asked in the same breath.
 | URL ending `/stac/v1`, has `/search` or conforms to STAC API | STAC API | `pystac-client` search; sample N per collection |
 | `catalog.json` / `collection.json` / `item.json` (URL or path) | Static STAC | walk `child`/`item` links with `pystac`; no API assumptions |
 | `https://`, `s3://`, `gs://`, `az://` file or store root | Direct asset | detect format, assess directly |
+| CMR granule concept ID, e.g. `G4289749526-ASF` (`^G\d+-[A-Z0-9_]+$`) | `cmr-granule` | `scripts/resolve_granule.py` → the granule's `s3://` URLs + its `/s3credentials` endpoint; assess every direct-access S3 URL in-region (HTTPS URLs are reference only) |
 | Local file or directory | Uploaded data | detect format(s), assess directly |
 | JSON-LD with `@context` mentioning `mlcommons.org/croissant` | Croissant / GeoCroissant | resolve `distribution` FileObject/FileSet to URLs; see `references/croissant.md` |
 
@@ -149,11 +175,22 @@ Hard rules:
    row-group stats (Parquet).
 7. **Graceful degradation**: network blocked or auth failure ⇒ mark smoke
    test `SKIPPED` (not failed), state why, and downgrade the report's
-   **confidence label** — not the score.
+   **confidence label** — not the score. The NASA-specific skip reasons:
+   - `nasa-credentials-required` — a protected NASA Earthdata `s3://` asset
+     with no granule ID / credentials endpoint supplied. Re-run with
+     `--granule-id` or `--credentials-url` (see step 5).
+   - `in-region-only` — credentials minted successfully but S3 denied the
+     read: expected outside AWS `us-west-2`. Hosting is fine; re-run
+     in-region for live Dimension-D evidence.
+
+   NASA S3 assets are **never** rerouted to a public HTTPS URL to dodge
+   either case; an EDL bearer-token retry applies to HTTPS *inputs* only.
 
 Required libraries (degrade feature-by-feature if missing, never crash):
 `rasterio`, `rio-cogeo`, `zarr`, `xarray`, `h5py`, `fsspec`, `s3fs`,
-`pyarrow`, `pystac`, `pystac-client`, `httpx`.
+`pyarrow`, `pystac`, `pystac-client`, `httpx`, `obstore` (>=0.9, NASA
+Earthdata S3 credentials), `earthaccess` (optional — user-chosen fallback
+only).
 
 ## Outputs
 

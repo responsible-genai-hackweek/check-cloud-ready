@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 import smoke_test as st  # noqa: E402
+import resolve_granule  # noqa: E402
 
 
 def _try(name):
@@ -125,7 +126,12 @@ def magic_to_format(b: bytes) -> str | None:
 
 
 # ------------------------------------------------------------ input detection
+CMR_GRANULE_RE = re.compile(r"^G\d+-[A-Z0-9_]+$")
+
+
 def detect_input(raw: str) -> str:
+    if CMR_GRANULE_RE.match(raw.strip()):
+        return "cmr-granule"
     p = Path(raw)
     if p.exists():
         if p.is_dir():
@@ -207,6 +213,9 @@ def gather_assets(raw, input_type, max_assets, sample_all, no_network, notes):
                    "item_datetime": None} for f in files]
         return assets, {"strategy": "local directory walk",
                         "selection_rule": f"first {len(assets)} files (sorted)"}
+
+    if input_type == "cmr-granule":
+        return gather_cmr_granule(raw, max_assets, notes)
 
     if input_type == "croissant":
         return gather_croissant(raw, max_assets, notes)
@@ -381,6 +390,47 @@ def gather_stac_static(url, max_assets, sample_all, notes):
     return assets_out, {"strategy": "static STAC walk (child/item links), "
                                     "first/middle/last items per node",
                         "nodes_visited": len(seen), "trace": frames[:50]}
+
+
+def gather_cmr_granule(granule_id, max_assets, notes):
+    """Resolve a CMR granule concept ID to its S3 assets. The granule's own
+    `/s3credentials` endpoint is carried on the sample frame so the run can
+    read the (usually protected) NASA S3 objects directly — HTTPS URLs from
+    CMR are recorded for reference only, never assessed in place of S3."""
+    frame = {"strategy": "CMR granule resolution (UMM-G RelatedUrls)",
+             "granule_id": granule_id, "selection_rule":
+                 "every GET DATA VIA DIRECT ACCESS s3:// URL on the granule"}
+    try:
+        resolved = resolve_granule.resolve(granule_id)
+    except SystemExit as e:  # resolve() is CLI-style: sys.exit(msg)
+        notes.append(f"CMR resolution failed for granule {granule_id}: {e}")
+        frame["error"] = str(e)
+        return [], frame
+
+    s3_urls = resolved.get("s3_urls") or []
+    frame.update(credentials_url=resolved.get("credentials_url"),
+                 provider=resolved.get("provider"),
+                 s3_urls_found=len(s3_urls),
+                 https_urls_found=len(resolved.get("https_urls") or []))
+    if not s3_urls:
+        notes.append(
+            f"granule {granule_id} has no 'GET DATA VIA DIRECT ACCESS' s3:// "
+            "URLs in CMR — nothing to assess in-region (HTTPS-only granules "
+            "are not assessed as a substitute)")
+        return [], frame
+    if resolved.get("credentials_url") is None:
+        notes.append(
+            f"granule {granule_id} has no s3credentials endpoint in CMR; "
+            "pass --credentials-url explicitly if the DAAC publishes one")
+
+    assets = [{"id": Path(urlparse(u).path or u).name or u, "url": u,
+               "collection": resolved.get("provider"), "media_type": None,
+               "format_hint": None, "roles": ["data"], "item_datetime": None,
+               "granule_id": granule_id}
+              for u in s3_urls]
+    if max_assets:
+        assets = assets[:max_assets]
+    return assets, frame
 
 
 def gather_croissant(raw, max_assets, notes):
@@ -1007,6 +1057,16 @@ def main():
                          "commentary")
     ap.add_argument("--profile", choices=["interactive", "training", "agentic"],
                     default=None, help="primary intended access profile, if known")
+    ap.add_argument("--granule-id",
+                    help="CMR granule concept ID (e.g. G4289749526-ASF) whose "
+                         "s3credentials endpoint should be used for NASA "
+                         "Earthdata S3 assets")
+    ap.add_argument("--credentials-url",
+                    help="DAAC s3credentials endpoint (wins over the endpoint "
+                         "resolved from a granule ID)")
+    ap.add_argument("--earthaccess-fallback", action="store_true",
+                    help="opt-in earthaccess credential fallback (never used "
+                         "implicitly)")
     args = ap.parse_args()
     var_list = [v.strip() for v in (args.variables or "").split(",") if v.strip()] or None
 
@@ -1018,6 +1078,32 @@ def main():
 
     assets, frame = gather_assets(args.input, input_type, args.max_assets,
                                   args.sample_all, args.no_network, notes)
+
+    # Credentials endpoint: explicit flag wins, then the one CMR published for
+    # --granule-id, then the one the resolved input carried on its sample frame.
+    granule_id = args.granule_id or (args.input if input_type == "cmr-granule"
+                                     else None)
+    credentials_url = args.credentials_url
+    if not credentials_url and args.granule_id:
+        credentials_url = st.resolve_credentials_url(granule_id=args.granule_id)
+    if not credentials_url:
+        credentials_url = (frame or {}).get("credentials_url")
+    if credentials_url:
+        print(f"[assess] NASA S3 credentials endpoint: {credentials_url}",
+              file=sys.stderr)
+    nasa_access = ("obstore-cmr" if credentials_url else
+                   "earthaccess-fallback" if args.earthaccess_fallback else
+                   "anon" if any(urlparse(a["url"]).scheme in ("s3", "gs", "az")
+                                 for a in assets) else None)
+    input_meta = {"raw": args.input, "type": input_type,
+                  "profile_hint": args.profile,
+                  "granule_id": granule_id,
+                  "credentials_url": credentials_url}
+    if isinstance(frame, dict):  # surfaced in the report's sample-frame block
+        if granule_id:
+            frame.setdefault("granule_id", granule_id)
+        if credentials_url:
+            frame.setdefault("credentials_url", credentials_url)
     if not assets:
         # Unassessable is not the same claim as F: F means "assessed and it
         # failed"; this means we could not reach/parse the input at all.
@@ -1027,15 +1113,15 @@ def main():
                      "no reachable items). No tier or score is assigned.")
         findings = {"skill": "earth-science-cloud-readiness",
                     "generated": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                    "input": {"raw": args.input, "type": input_type,
-                              "profile_hint": args.profile},
+                    "input": input_meta,
                     "sample_frame": frame,
                     "environment": {"network": not args.no_network,
+                                    "nasa_access": nasa_access,
                                     "libraries": {m: (_try(m) is not None) for m in
                                                   ("rasterio", "rio_cogeo", "zarr",
                                                    "xarray", "h5py", "fsspec", "s3fs",
                                                    "pyarrow", "pystac", "pystac_client",
-                                                   "httpx")}},
+                                                   "httpx", "obstore")}},
                     "notes": notes, "assets": [],
                     "rollup": {"by_media_type": {}, "dominant_format": None,
                                "dataset_score": None, "dataset_tier": None,
@@ -1055,11 +1141,15 @@ def main():
     for a in assets:
         fmt0 = detect_format(a, None)
         tel = st.run_smoke_test(a["url"], fmt0, no_network=args.no_network,
-                                variables=var_list)
+                                variables=var_list,
+                                credentials_url=credentials_url,
+                                earthaccess_fallback=args.earthaccess_fallback)
         fmt = detect_format(a, tel)
         if fmt != fmt0:
             tel = st.run_smoke_test(a["url"], fmt, no_network=args.no_network,
-                                    variables=var_list)
+                                    variables=var_list,
+                                    credentials_url=credentials_url,
+                                    earthaccess_fallback=args.earthaccess_fallback)
         checks = score_asset(a, fmt, tel)
         dims = rollup_checks(checks)
         score = round(sum(d["score"] for d in dims.values()), 1)
@@ -1109,14 +1199,15 @@ def main():
     findings = {
         "skill": "earth-science-cloud-readiness",
         "generated": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "input": {"raw": args.input, "type": input_type,
-                  "profile_hint": args.profile},
+        "input": input_meta,
         "sample_frame": frame,
         "environment": {"network": not args.no_network,
+                        "nasa_access": nasa_access,
                         "libraries": {m: (_try(m) is not None) for m in
                                       ("rasterio", "rio_cogeo", "zarr", "xarray",
                                        "h5py", "fsspec", "s3fs", "pyarrow",
-                                       "pystac", "pystac_client", "httpx")}},
+                                       "pystac", "pystac_client", "httpx",
+                                       "obstore")}},
         "notes": notes,
         "assets": results,
         "rollup": ru,
