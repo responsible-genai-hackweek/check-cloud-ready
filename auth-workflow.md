@@ -21,8 +21,15 @@ The workflow accepts either of two entry points:
 
 If the input is a granule ID rather than a URL:
 
-- **Query CMR** to resolve the granule to its credentials entrypoint. Example: https://cmr.earthdata.nasa.gov/search/concepts/G4289749526-ASF.umm_json points to "https://nisar.asf.earthdatacloud.nasa.gov/s3credentials" for the link with description "S3 credentials endpoint for direct in-region bucket access"
-- Access the resolved assets via **obstore**.
+- **Query CMR** to resolve the granule to its credentials entrypoint. Implemented
+  by `scripts/resolve_granule.py <granule-id>` (present in both skills), which
+  fetches `https://cmr.earthdata.nasa.gov/search/concepts/<id>.umm_json` and
+  returns the granule's s3 data URL(s) plus the DAAC's `/s3credentials` endpoint.
+  Example: `G4289749526-ASF` resolves to
+  `https://nisar.asf.earthdatacloud.nasa.gov/s3credentials` for the link with
+  description "S3 credentials endpoint for direct in-region bucket access".
+- Access the resolved assets via **obstore**, using the resolved endpoint as
+  `--credentials-url` on every subsequent script.
 
 ```python
 from obstore.store import S3Store
@@ -54,9 +61,8 @@ finally:
     cp.close()
 ```
 
-- For the object-store endpoint: **guess the Earthdata endpoint, or let the
-  user provide the endpoint explicitly** (endpoint provision is the escape
-  hatch when guessing fails).
+- For the object-store endpoint, absent a granule ID: **guess from the
+  whitelist, or let the user provide the endpoint explicitly** — see Step 3.
 
 The resolved URL then joins the main flow below.
 
@@ -66,25 +72,48 @@ Decision: **is the item URL publicly accessible?**
 
 - **Public → go straight to Assess.** No credential setup; open the store
   (obstore) and proceed.
-- **Not public → ask for Earthdata credentials** (username + password, e.g.
-  `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD` or `~/.netrc`), then branch on
-  protocol.
+- **Not public → ask for Earthdata credentials** (`EARTHDATA_TOKEN`, or
+  `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or `~/.netrc` — never typed into
+  the conversation), then branch on protocol.
 
-## Step 3 — Protected access, by protocol (HTTP vs S3)
+## Step 3b — Protected access, by protocol (HTTP vs S3)
 
 - **HTTP**: authenticate with an **`Authorization: Bearer <token>`** header
-  (EDL bearer token minted from the Earthdata credentials).
-- **S3**: 
-  - Use S3, don't try HTTPS
-  - ask if they want to use obstore or earthaccess
-  - earthaccess
-    - Which **DAAC** issues the credentials — do we know it, or do we **guess**?
-    - obtain temporary S3 credentials via **earthaccess (EA)**
-  - obstore
-    - ask if they have the granule id, if so go back to step 2
-    - if not, ask if they have the nasa endpoint for credentials to generate with obstore or want the agent to guess
+  (EDL bearer token minted from the Earthdata credentials via
+  `nasa_s3.edl_bearer_token()`). This retry is **host-gated**: the token is
+  only ever sent when the response redirected to `urs.earthdata.nasa.gov`, or
+  the URL itself looks like a NASA Earthdata host (per
+  `nasa_s3.looks_like_nasa_earthdata`) — a 401/403 from an unrelated host is
+  never answered with the user's EDL credential.
+- **S3**: never try HTTPS as a substitute — implemented ask, in order:
+  1. **Granule ID?** If the user has one (or it was already resolved in Step
+     2), use it — go back to Step 2 / pass `--credentials-url` from that
+     resolution. This is the recommended path.
+  2. **Explicit endpoint?** If they have the DAAC's `/s3credentials` URL
+     directly, use it as `--credentials-url`.
+  3. **Whitelist guess.** Neither of the above: offer a guess from
+     `KNOWN_CREDENTIALS_ENDPOINTS` in `scripts/nasa_s3.py` (both skills), and
+     have the user confirm which one looks right. This whitelist is
+     implemented — it is no longer a "perhaps we should" idea.
+  4. **earthaccess fallback (opt-in only).** If none of the above resolves it
+     and the user explicitly chooses to, fall back to earthaccess: ask which
+     **DAAC** issues the credentials (known or guessed via CLI flag
+     `--earthaccess-fallback`), then obtain temporary S3 credentials via
+     **earthaccess**.
 
-Note: in cases where the agent is guessing perhaps we can compile a whitelist of earthdata credentials endpoints to use and ask the user which one looks right.
+  All of 1–3 consume obstore's `NasaEarthdataCredentialProvider` directly
+  (`scripts/nasa_s3.py`); CLI flags across the scripts are `--granule-id`,
+  `--credentials-url`, and `--earthaccess-fallback`.
+
+  **Failure classification** (never FAILED — always SKIPPED, since these are
+  access-environment facts, not dataset defects):
+  - `credentials-endpoint-auth` — EDL/URS rejected the credentials-endpoint
+    request (bad/missing/expired EDL credentials). Fix: check
+    `EARTHDATA_TOKEN` / `EARTHDATA_USERNAME`+`EARTHDATA_PASSWORD` / `~/.netrc`.
+  - `in-region-only` — S3 credentials minted successfully but the bucket/object
+    read was denied. Expected outside AWS us-west-2; re-run from in-region
+    compute. The scorecard's hosting row still PASSes; byte-range/chunking
+    criteria become "not assessed — requires in-region compute."
 
 ## Step 4 — Assess: dispatch by format
 
@@ -105,22 +134,24 @@ board spans these branches.
 ## Flow summary
 
 ```
-granule id ──▶ query CMR ──▶ obstore ─────────────────────────┐
-   (guess ED endpoint, or user provides endpoint)             │
-                                                              ▼
-item URL/path ──▶ public? ── yes ───────────────────────▶  ASSESS
-                     │                                        ▲
-                     no                                       │
-                     ▼                                        │
-        set Earthdata credentials (user/pass)                 │
-                     │                                        │
-              ┌── protocol? ──┐                               │
-            HTTP              S3                              │
-              │                │                              │
-      Bearer token      earthaccess (daac?) or obstore (granule id or endpoint) │
-              │                                               │
-              └──────▶ file handle ◀──┘                       │
-                          └───────────────────────────────────┘
+granule id ──▶ resolve_granule.py (CMR) ──▶ credentials_url + s3 URL(s) ──▶ obstore ──┐
+                                                                                       │
+item URL/path ──▶ public? ── yes ─────────────────────────────────────────────▶   ASSESS
+                     │                                                                ▲
+                     no                                                               │
+                     ▼                                                                │
+        EDL credentials present? (EARTHDATA_TOKEN / USERNAME+PASSWORD / ~/.netrc)     │
+                     │                                                                │
+              ┌── protocol? ──┐                                                       │
+            HTTP              S3 (never HTTPS fallback)                               │
+              │                │                                                      │
+      Bearer token       granule id → Step 2, or endpoint (known/whitelist-guessed)   │
+      (host-gated:       → obstore NasaEarthdataCredentialProvider,                   │
+      URS/NASA host      or opt-in earthaccess fallback (daac known/guessed)          │
+      only)                    │                                                      │
+              │           credentials-endpoint-auth / in-region-only → SKIPPED        │
+              │                │                                                      │
+              └──────▶ file handle ◀──────────────────────────────────────────────────┘
 
 ASSESS ──▶ HDF5/NetCDF ─▶ h5py/xarray ─┐
       ├──▶ Zarr ────────▶ GeoZarr      ├─ CF checks (xarray)

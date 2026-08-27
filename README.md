@@ -110,8 +110,11 @@ The agent installs these lazily as the workflow needs them (each script names
 its missing imports):
 
 ```bash
-pip install requests boto3 s3fs fsspec xarray zarr h5py netCDF4 numcodecs zstandard earthaccess
+pip install requests boto3 s3fs fsspec xarray zarr h5py netCDF4 numcodecs zstandard obstore
 ```
+
+Optional (fallback only): `earthaccess` — only needed if the user explicitly
+opts into the earthaccess fallback path instead of obstore.
 
 Optional: `compliance-checker` (formal CF check), `cf_xarray`,
 `xbitinfo` (lossy bit-rounding analysis),
@@ -120,10 +123,21 @@ Optional: `compliance-checker` (formal CF check), `cf_xarray`,
 ## Credentials
 
 The skill never asks for credentials in the conversation. For NASA Earthdata
-Login, set up `~/.netrc` (`machine urs.earthdata.nasa.gov login ... password ...`,
-`chmod 600`) or `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD` env vars —
-`earthaccess` picks them up automatically. AWS credentials follow the standard
-chain (env vars, `~/.aws/credentials`, instance profile).
+Login (EDL), set `EARTHDATA_TOKEN` (a bearer token), or
+`EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD` env vars, or `~/.netrc`
+(`machine urs.earthdata.nasa.gov login ... password ...`, `chmod 600`) — never
+typed into the conversation.
+
+The recommended entrypoint for NASA Earthdata data is a CMR granule concept ID
+(e.g. `G4289749526-ASF`): one CMR lookup (`scripts/resolve_granule.py`) yields
+both the granule's s3 URL(s) and the DAAC's `/s3credentials` endpoint, which
+obstore's `NasaEarthdataCredentialProvider` consumes directly to mint S3
+credentials. `earthaccess` is an optional, user-chosen fallback, not the
+default path. Minted S3 keys work only from in-region (us-west-2) compute —
+anywhere else, expect access denied even with valid credentials.
+
+AWS credentials follow the standard chain (env vars, `~/.aws/credentials`,
+instance profile).
 
 ## What you get
 
