@@ -112,16 +112,36 @@ def _is_string_or_bool_dtype(dtype: str | None) -> bool:
 
 
 def _is_excluded(v: dict) -> bool:
+    """QA/flag/quality/mask, bounds, and CRS/grid-mapping patterns are
+    matched as plain case-insensitive substrings of the FULL name/path
+    — a keyword in a parent group segment (e.g.
+    "/science/LSAR/GCOV/quality/pixelValidityMap") excludes the
+    variable just as surely as a keyword in the leaf itself would,
+    since the path segment is where the provider's intent ("this
+    subtree is QA data") actually lives. Only the coordinate-variable
+    rule (name equals one of its own dims, or is a common coordinate
+    name) is scoped to the basename — a coordinate is identified by
+    its own leaf name, not by which group happens to contain it.
+
+    This is plain substring matching, not word-boundary matching (no
+    regex \\b anchoring): "bounds" only matches names that contain the
+    literal run "b-o-u-n-d-s", so e.g. "boundaryLayerHeight" ("bound"
+    then "ary", never "bounds") is untouched by the bounds rule. That
+    happens to hold for all patterns here (none is a short prefix of a
+    common unrelated English word in the way "bounds" almost is), so
+    plain substring matching does not need word-boundary logic to
+    avoid false positives for these particular tokens.
+    """
     name = v.get("name", "")
     base = _basename(name)
     dims = v.get("dims") or []
     shape = v.get("shape") or []
 
-    if _matches_any_pattern(base, _QA_PATTERNS):
+    if _matches_any_pattern(name, _QA_PATTERNS):
         return True
-    if _matches_any_pattern(base, _BOUNDS_PATTERNS):
+    if _matches_any_pattern(name, _BOUNDS_PATTERNS):
         return True
-    if _matches_any_pattern(base, _CRS_PATTERNS):
+    if _matches_any_pattern(name, _CRS_PATTERNS):
         return True
     if base in dims:
         return True
@@ -169,6 +189,6 @@ def format_inventory_table(inventory: list[dict]) -> str:
         dims = ",".join(v.get("dims") or [])
         shape = ",".join(str(n) for n in (v.get("shape") or []))
         lines.append(
-            f"{i}  {v['name']}  ({dims})×({shape})  {v.get('dtype', '')}"
+            f"{i}  {v.get('name', '')}  ({dims})×({shape})  {v.get('dtype', '')}"
         )
     return "\n".join(lines)

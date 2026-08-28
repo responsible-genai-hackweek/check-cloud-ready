@@ -204,6 +204,80 @@ class TestEmptyInventory(unittest.TestCase):
         self.assertEqual(rank_variables([]), [])
 
 
+class TestRankExclusionFullPathScope(unittest.TestCase):
+    """QA/flag/quality/mask, bounds, and CRS/projection patterns must be
+    matched against the FULL path, not just the leaf/basename — a
+    keyword living in a parent group segment is just as disqualifying
+    as one in the leaf name itself. Only the coordinate-variable rule
+    (name-equals-own-dim / common-coord-name) stays scoped to the
+    basename.
+    """
+
+    def test_qa_keyword_in_parent_path_segment_excludes_leaf(self):
+        # "quality" appears only in a parent group segment; the leaf
+        # name "pixelValidityMap" itself contains none of the QA/flag/
+        # bounds/CRS keywords. Same shape as a legitimate science var,
+        # so if this survived exclusion it would out-rank or tie with
+        # real science data.
+        qa_leaf = var("/science/LSAR/GCOV/quality/pixelValidityMap",
+                       dims=["y", "x"], shape=[8000, 6000], dtype="float32")
+        science = var("/science/LSAR/GCOV/grids/frequencyA/HHHH",
+                       dims=["y", "x"], shape=[8000, 6000], dtype="complex64")
+        ranked = rank_variables([qa_leaf, science])
+        self.assertEqual([v["name"] for v in ranked], [science["name"]])
+
+    def test_bounds_keyword_in_parent_path_segment_excludes_leaf(self):
+        bounds_leaf = var("/science/LSAR/GCOV/bounds/edgeMap",
+                           dims=["y", "x"], shape=[8000, 6000], dtype="float32")
+        science = var("/science/LSAR/GCOV/grids/frequencyA/HHHH",
+                       dims=["y", "x"], shape=[8000, 6000], dtype="complex64")
+        ranked = rank_variables([bounds_leaf, science])
+        self.assertEqual([v["name"] for v in ranked], [science["name"]])
+
+    def test_crs_keyword_in_parent_path_segment_excludes_leaf(self):
+        crs_leaf = var("/science/LSAR/GCOV/projection/gridValues",
+                        dims=["y", "x"], shape=[8000, 6000], dtype="float32")
+        science = var("/science/LSAR/GCOV/grids/frequencyA/HHHH",
+                       dims=["y", "x"], shape=[8000, 6000], dtype="complex64")
+        ranked = rank_variables([crs_leaf, science])
+        self.assertEqual([v["name"] for v in ranked], [science["name"]])
+
+    def test_science_var_with_no_keyword_anywhere_in_path_is_ranked(self):
+        science = var("/science/LSAR/GCOV/grids/frequencyA/HHHH",
+                       dims=["y", "x"], shape=[8000, 6000], dtype="complex64")
+        ranked = rank_variables([science])
+        self.assertEqual([v["name"] for v in ranked], [science["name"]])
+
+    def test_boundary_layer_height_not_excluded_by_bounds_rule(self):
+        # Plain substring matching, not word-boundary matching:
+        # "bounds" (b-o-u-n-d-s) is not a substring of "boundary"
+        # (b-o-u-n-d-a-r-y — "bound" is followed by "a", never "s"),
+        # so this word-ish name is untouched by the bounds exclusion
+        # even though it starts with "bound".
+        v = var("boundaryLayerHeight", dims=["x"], shape=[10], dtype="float32")
+        ranked = rank_variables([v])
+        self.assertEqual([r["name"] for r in ranked], ["boundaryLayerHeight"])
+
+
+class TestMatchVariablesEdgeCases(unittest.TestCase):
+    def test_empty_requested_list_returns_empty(self):
+        self.assertEqual(match_variables(NISAR_LIKE, []), [])
+
+    def test_duplicate_name_inventory_is_not_double_counted(self):
+        dup = [
+            var("/a/HHHH", dims=["y", "x"], shape=[10, 10]),
+            var("/a/HHHH", dims=["y", "x"], shape=[10, 10]),
+            var("/a/HVHV", dims=["y", "x"], shape=[10, 10]),
+        ]
+        out = match_variables(dup, ["HHHH"])
+        # Both inventory entries named "/a/HHHH" match the token; the
+        # matcher dedupes by name, but since both records share that
+        # name, filtering `inventory` by matched-name naturally
+        # reproduces every record with that name (no swallowing of a
+        # legitimately repeated record).
+        self.assertEqual([v["name"] for v in out], ["/a/HHHH", "/a/HHHH"])
+
+
 # --------------------------------------------------------------- table format
 
 class TestFormatInventoryTable(unittest.TestCase):
