@@ -276,10 +276,16 @@ def _open_hdf5(fs, cfs, budget: telemetry.Budget, path: str):
         return _result("skipped", reason="h5py not installed")
 
     before = cfs.snapshot()
+    f = None
     try:
         f = cfs.open(path, "rb")
         h5 = h5py.File(f, "r")
     except Exception as e:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
         if _is_auth_error(e):
             return _result("skipped", reason=f"auth: {type(e).__name__}: {e}")
         return _result("fail", reason=f"{type(e).__name__}: {e}")
@@ -319,6 +325,17 @@ def _zarr_consolidated_probe(cfs, path: str) -> dict:
     which is enough to tell whether the store is consolidated (a
     single request reveals the whole layout) -- the "trivially
     1-request" case called out for zarr in the S7 fix.
+
+    ``consolidated=False`` is an explicitly supported outcome of this
+    probe (a non-consolidated v2 store is a common, legitimate layout,
+    not a failure -- see ``formats.sniff_store``'s "dispersed metadata"
+    note). When no consolidated-metadata index is found, this still
+    counts one real metadata read (``.zgroup``, falling back to
+    ``.zarray`` for a store whose root is itself an array) through
+    ``cfs`` so ``bytes_to_open`` reflects genuine store-metadata I/O
+    instead of reporting a bogus 0 -- a 0-byte "successful" probe here
+    would otherwise trip ``assert_open_measured``'s zero-bytes guard on
+    a perfectly legitimate, correctly-classified store.
     """
     base = path.rstrip("/")
     for key, ver in ((f"{base}/zarr.json", 3), (f"{base}/.zmetadata", 2)):
@@ -332,6 +349,14 @@ def _zarr_consolidated_probe(cfs, path: str) -> dict:
             meta = {}
         consolidated = (meta.get("consolidated_metadata") is not None) if ver == 3 else True
         return {"zarr_version": ver, "consolidated": consolidated, "key": key}
+
+    for key in (f"{base}/.zgroup", f"{base}/.zarray"):
+        try:
+            cfs.cat_file(key)
+        except Exception:
+            continue
+        return {"zarr_version": 2, "consolidated": False, "key": key}
+
     return {"zarr_version": None, "consolidated": False, "key": None}
 
 
@@ -492,10 +517,16 @@ def _open_parquet(fs, cfs, budget: telemetry.Budget, path: str):
         return _result("skipped", reason="pyarrow not installed")
 
     before = cfs.snapshot()
+    f = None
     try:
         f = cfs.open(path, "rb")
         pf = papq.ParquetFile(f)
     except Exception as e:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
         if _is_auth_error(e):
             return _result("skipped", reason=f"auth: {type(e).__name__}: {e}")
         return _result("fail", reason=f"{type(e).__name__}: {e}")
@@ -506,6 +537,10 @@ def _open_parquet(fs, cfs, budget: telemetry.Budget, path: str):
     try:
         telemetry.assert_open_measured({"bytes_read": bytes_to_open})
     except telemetry.MeasurementError as e:
+        try:
+            f.close()
+        except Exception:
+            pass
         return _result("fail", reason=str(e))
 
     md = pf.metadata

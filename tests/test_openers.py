@@ -137,6 +137,25 @@ class HDF5OpenerTests(unittest.TestCase):
         self.assertGreater(result["telemetry"]["bytes_to_open"], 0)
         result["handle"].close()
 
+    def test_metadata_walk_object_cap_breach_marks_incomplete(self):
+        """Force the object-count ceiling down to a value smaller than
+        this fixture's tree, so the walk must stop early and report
+        complete=False / capped_at="objects" -- locks in the cap-breach
+        path (previously exercised only by manual verification)."""
+        original_max = openers._METADATA_WALK_MAX_OBJECTS
+        openers._METADATA_WALK_MAX_OBJECTS = 3
+        try:
+            result, _ = self._open()
+        finally:
+            openers._METADATA_WALK_MAX_OBJECTS = original_max
+
+        walk = result["metadata_walk"]
+        self.assertFalse(walk["complete"])
+        self.assertEqual(walk["capped_at"], "objects")
+        self.assertLessEqual(walk["objects_visited"], 3)
+        if result["handle"] is not None:
+            result["handle"].close()
+
 
 @unittest.skipUnless(zarr, "zarr not installed")
 class ZarrOpenerTests(unittest.TestCase):
@@ -173,6 +192,27 @@ class ZarrOpenerTests(unittest.TestCase):
         result = openers.open_dataset("zarr", _local_fs(), path, budget)
         self._assert_common(result)
         self.assertEqual(result["format_checks"]["zarr_version"], 2)
+
+    def test_v2_non_consolidated_store_is_still_ok_with_nonzero_bytes(self):
+        """A v2 store with no .zmetadata is a legitimate, common layout
+        (consolidated=False is an explicitly supported outcome of this
+        opener, not a failure) -- it must not trip the zero-bytes
+        measurement guard just because the consolidated-metadata probe
+        found nothing to read."""
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "store.zarr")
+        g = zarr.open_group(path, mode="w", zarr_format=2)
+        g.create_array("data", shape=(20, 20), chunks=(5, 5), dtype="f4")
+        # deliberately no zarr.consolidate_metadata(...) call
+
+        budget = Budget()
+        result = openers.open_dataset("zarr", _local_fs(), path, budget)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["format_checks"]["consolidated"])
+        self.assertGreater(result["telemetry"]["bytes_to_open"], 0)
+        rec = next(v for v in result["inventory"] if v["name"] == "/data")
+        self.assertEqual(rec["chunks"], [5, 5])
 
 
 @unittest.skipUnless(papq, "pyarrow not installed")
