@@ -12,9 +12,14 @@ In short:
 2. Probe anonymously first (``access.probe``). Public data needs no
    credential setup.
 3. Protected ``s3://``: NEVER fall back to HTTPS (see the invariant
-   note below). Prefer a CMR granule ID (round-trips to step 1); else a
-   DAAC ``s3credentials`` endpoint (offered from a whitelist); else
-   earthaccess, if the caller opts in.
+   note below). The NASA-specific credential flow (granule ID / DAAC
+   ``s3credentials`` whitelist / earthaccess) is gated on
+   ``nasa_s3.looks_like_nasa_earthdata(url)``; when that heuristic is
+   negative, ask once via the prompter whether this actually is NASA
+   Earthdata data before offering any of those NASA-specific options --
+   "no" (or an unconfirmed default) yields a generic protected-bucket
+   finding (signed-access/requester-pays hints from the probe) with no
+   further NASA-flavored prompts.
 4. Protected ``https://``: mint an Earthdata Login bearer token and use
    an ``Authorization: Bearer`` header. Never prompt for a password
    in-band; if no token is available (no ``EARTHDATA_TOKEN``, no
@@ -56,13 +61,44 @@ __all__ = ["AccessResult", "resolve_access", "GranuleResolutionError"]
 
 @dataclass
 class AccessResult:
+    """``auth`` names the method that PRODUCED a usable access route
+    (or, for the terminal-failure values, why none was produced):
+    ``"anonymous"`` | ``"obstore-cmr"`` | ``"obstore-endpoint"`` |
+    ``"earthaccess"`` | ``"edl-bearer"`` | ``"local"`` |
+    ``"no-network"`` | ``"error"``.
+
+    Two invariants hold for every ``AccessResult`` this module returns
+    (enforced by ``_make_result`` below, not just by convention):
+
+    (a) ``fs is None`` implies ``auth in {"local", "no-network", "error"}``
+        -- if no filesystem was built, the auth value must say why (a
+        local path was never network-assessable, network access was
+        deliberately skipped, or resolution failed) rather than naming
+        a method that supposedly produced a route that doesn't exist.
+    (b) ``auth == "error"`` if and only if resolution reached a
+        terminal failure with no usable route; it is always paired
+        with a "fail" or "skipped" finding explaining what was tried
+        and why it didn't work -- never a bare/unexplained failure.
+    """
     fs: Any            # fsspec-like filesystem, or None for plain-local
     path: str          # path usable with fs (or local path)
     url: str           # original/canonical URL
     findings: list      # check-dicts (Dimension D evidence)
-    auth: str          # "anonymous" | "obstore-cmr" | "obstore-endpoint" |
-                        # "earthaccess" | "edl-bearer" | "local" | "error"
+    auth: str
     notes: list = field(default_factory=list)
+
+
+# fs=None is only valid for these auth values (see AccessResult docstring,
+# invariant (a)). _make_result is the single construction point for every
+# AccessResult returned by this module so the invariant can't drift.
+_FS_NONE_ALLOWED_AUTH = {"local", "no-network", "error"}
+
+
+def _make_result(fs, path, url, findings, auth, notes):
+    if fs is None and auth not in _FS_NONE_ALLOWED_AUTH:
+        auth = "error"
+    return AccessResult(fs=fs, path=path, url=url, findings=findings,
+                         auth=auth, notes=notes)
 
 
 # --------------------------------------------------------------- findings
@@ -157,7 +193,7 @@ def resolve_access(input_str: str, *, prompter, anon=False, granule_id=None,
             remediation=("Point check-cloud-ready at the cloud-hosted URL "
                         "or granule ID instead of a local copy."),
         ))
-        return AccessResult(fs=None, path=input_str, url=input_str,
+        return _make_result(fs=None, path=input_str, url=input_str,
                              findings=findings, auth="local", notes=notes)
 
     if no_network:
@@ -166,8 +202,8 @@ def resolve_access(input_str: str, *, prompter, anon=False, granule_id=None,
             "no_network=True: all access probes and remote resolution "
             "were skipped.",
         ))
-        return AccessResult(fs=None, path=input_str, url=input_str,
-                             findings=findings, auth="local", notes=notes)
+        return _make_result(fs=None, path=input_str, url=input_str,
+                             findings=findings, auth="no-network", notes=notes)
 
     if kind == "granule-id":
         return _resolve_from_granule(
@@ -198,7 +234,7 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
                         "G<digits>-<PROVIDER>), or supply a direct URL "
                         "instead."),
         ))
-        return AccessResult(fs=None, path=granule_id, url=granule_id,
+        return _make_result(fs=None, path=granule_id, url=granule_id,
                              findings=findings, auth="error", notes=notes)
 
     credentials_url = result.get("credentials_url")
@@ -222,7 +258,7 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
             f"Granule {granule_id!r} resolved via CMR but has no S3 or "
             "HTTPS data URLs.",
         ))
-        return AccessResult(fs=None, path=granule_id, url=granule_id,
+        return _make_result(fs=None, path=granule_id, url=granule_id,
                              findings=findings, auth="error", notes=notes)
 
     if not url.startswith("s3://"):
@@ -233,14 +269,14 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
                                   earthaccess_fallback=earthaccess_fallback)
     except Exception as e:
         _append_s3_error_finding(findings, e)
-        return AccessResult(fs=None, path=url, url=url, findings=findings,
+        return _make_result(fs=None, path=url, url=url, findings=findings,
                              auth="error", notes=notes)
 
     findings.append(_finding(
         "D2-auth", "D", "pass",
         f"S3 access resolved via CMR credentials endpoint {credentials_url}.",
     ))
-    return AccessResult(fs=fs, path=path, url=url, findings=findings,
+    return _make_result(fs=fs, path=path, url=url, findings=findings,
                          auth="obstore-cmr", notes=notes)
 
 
@@ -254,7 +290,12 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
     public = probe_result.get("classification") == "ok"
 
     if public or anon:
-        fs, path = nasa_s3.get_fs(url, anon=True)
+        try:
+            fs, path = nasa_s3.get_fs(url, anon=True)
+        except Exception as e:
+            _append_s3_error_finding(findings, e)
+            return _make_result(fs=None, path=url, url=url, findings=findings,
+                                 auth="error", notes=notes)
         if public:
             evidence = "Anonymous S3 access succeeded (HeadObject + ranged GetObject)."
             status = "pass"
@@ -262,11 +303,15 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
             evidence = "anon=True forced anonymous S3 access despite a protected probe result."
             status = "warn"
         findings.append(_finding("D2-auth", "D", status, evidence))
-        return AccessResult(fs=fs, path=path, url=url, findings=findings,
+        return _make_result(fs=fs, path=path, url=url, findings=findings,
                              auth="anonymous", notes=notes)
 
     notes.append("Anonymous S3 access failed or requires authentication.")
 
+    # The caller already told us what to use (a granule ID or a
+    # credentials endpoint) -- honor that directly, regardless of the
+    # NASA-heuristic gate below (an explicit argument is a stronger
+    # signal than a guess).
     if granule_id:
         return _resolve_from_granule(
             granule_id, prompter=prompter, earthaccess_fallback=earthaccess_fallback,
@@ -278,9 +323,23 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
             return result
         return _maybe_earthaccess_fallback(url, prompter, earthaccess_fallback, findings, notes)
 
-    # Protected S3, and the caller supplied neither a granule ID nor a
-    # credentials endpoint up front: ask (per auth-workflow.md step 3 --
-    # a granule ID is preferred since CMR resolves the exact endpoint).
+    # Gate the NASA-specific credential flow (granule ID / DAAC
+    # s3credentials whitelist / earthaccess) on the URL heuristic; when
+    # it's negative, ask once rather than assuming every protected
+    # bucket is NASA Earthdata Cloud data.
+    is_nasa = nasa_s3.looks_like_nasa_earthdata(url)
+    if not is_nasa:
+        is_nasa = prompter.confirm(
+            "This S3 bucket doesn't match known NASA Earthdata Cloud "
+            "naming patterns -- is this NASA Earthdata data?",
+            default=False)
+    if not is_nasa:
+        return _generic_protected_s3_result(url, probe_result, findings, notes)
+
+    # Protected S3, confirmed (or heuristically detected) NASA Earthdata,
+    # and the caller supplied neither a granule ID nor a credentials
+    # endpoint up front: ask (per auth-workflow.md step 3 -- a granule ID
+    # is preferred since CMR resolves the exact endpoint).
     has_granule = prompter.confirm(
         "Do you have a CMR granule ID for this dataset?", default=False)
     if has_granule:
@@ -296,6 +355,36 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
             return result
 
     return _maybe_earthaccess_fallback(url, prompter, earthaccess_fallback, findings, notes)
+
+
+def _generic_protected_s3_result(url, probe_result, findings, notes):
+    """Non-NASA (or not confirmed NASA) protected S3 bucket: report what
+    the probe already learned (signed-access/requester-pays hints, if
+    any) without offering any NASA-specific credential path.
+    """
+    anon = probe_result.get("anonymous") or {}
+    signed = probe_result.get("signed") or {}
+    hint = anon.get("hint") or signed.get("hint")
+    if hint:
+        evidence = f"S3 object is not anonymously accessible. {hint}"
+    else:
+        evidence = (
+            "S3 object is not anonymously accessible. This may require AWS "
+            "credentials (e.g. requester-pays, or a bucket policy "
+            "restricted to specific principals or signed requests)."
+        )
+    findings.append(_finding(
+        "D2-auth", "D", "fail", evidence,
+        remediation=("Provide AWS credentials with access to this bucket "
+                    "via the standard AWS credential chain (env vars, "
+                    "~/.aws/credentials, instance role, ...), or verify "
+                    "requester-pays / bucket-policy requirements with the "
+                    "data provider."),
+    ))
+    notes.append("Not confirmed as NASA Earthdata data; no NASA-specific "
+                "credential path was offered.")
+    return _make_result(fs=None, path=url, url=url, findings=findings,
+                         auth="error", notes=notes)
 
 
 def _guess_credentials_endpoint_label(url):
@@ -332,7 +421,7 @@ def _try_build_via_credentials_url(url, credentials_url, findings, notes):
         "D2-auth", "D", "pass",
         f"S3 access resolved via credentials endpoint {credentials_url}.",
     ))
-    return AccessResult(fs=fs, path=path, url=url, findings=findings,
+    return _make_result(fs=fs, path=path, url=url, findings=findings,
                          auth="obstore-endpoint", notes=notes)
 
 
@@ -349,21 +438,21 @@ def _maybe_earthaccess_fallback(url, prompter, earthaccess_fallback, findings, n
             remediation=("Supply a granule ID, an s3credentials endpoint, "
                         "or opt into earthaccess."),
         ))
-        return AccessResult(fs=None, path=url, url=url, findings=findings,
+        return _make_result(fs=None, path=url, url=url, findings=findings,
                              auth="error", notes=notes)
 
     try:
         fs, path = nasa_s3.get_fs(url, earthaccess_fallback=True)
     except Exception as e:
         _append_s3_error_finding(findings, e)
-        return AccessResult(fs=None, path=url, url=url, findings=findings,
+        return _make_result(fs=None, path=url, url=url, findings=findings,
                              auth="error", notes=notes)
 
     findings.append(_finding(
         "D2-auth", "D", "pass",
         "S3 access resolved via earthaccess-minted temporary credentials.",
     ))
-    return AccessResult(fs=fs, path=path, url=url, findings=findings,
+    return _make_result(fs=fs, path=path, url=url, findings=findings,
                          auth="earthaccess", notes=notes)
 
 
@@ -390,47 +479,54 @@ def _resolve_https(url, *, findings, notes):
                         "EARTHDATA_PASSWORD, or configure ~/.netrc for "
                         "urs.earthdata.nasa.gov, then retry."),
         ))
-        return AccessResult(fs=None, path=url, url=url, findings=findings,
+        return _make_result(fs=None, path=url, url=url, findings=findings,
                              auth="error", notes=notes)
 
-    fs = _build_fsspec_https(headers={"Authorization": f"Bearer {token}"})
+    fs, build_error = _build_fsspec_https(headers={"Authorization": f"Bearer {token}"})
     if fs is None:
         findings.append(_finding(
             "D2-auth", "D", "skipped",
             "An Earthdata Login bearer token is available, but the local "
-            "HTTPS filesystem could not be constructed (fsspec https "
-            "support unavailable -- likely missing aiohttp).",
-            remediation="pip install aiohttp (or fsspec[http]).",
+            f"HTTPS filesystem could not be constructed: {build_error}",
+            remediation=_fs_build_remediation(build_error),
         ))
     else:
         findings.append(_finding(
             "D2-auth", "D", "pass",
             "HTTPS access authenticated via an Earthdata Login bearer token.",
         ))
-    return AccessResult(fs=fs, path=url, url=url, findings=findings,
+    return _make_result(fs=fs, path=url, url=url, findings=findings,
                          auth="edl-bearer", notes=notes)
 
 
 def _plain_https_fs(url, findings, notes):
-    fs = _build_fsspec_https(headers=None)
+    fs, build_error = _build_fsspec_https(headers=None)
     if fs is None:
         findings.append(_finding(
             "D2-auth", "D", "skipped",
-            "Anonymous HTTPS filesystem could not be constructed (fsspec "
-            "https support unavailable -- likely missing aiohttp).",
-            remediation="pip install aiohttp (or fsspec[http]).",
+            f"Anonymous HTTPS filesystem could not be constructed: {build_error}",
+            remediation=_fs_build_remediation(build_error),
         ))
-    return AccessResult(fs=fs, path=url, url=url, findings=findings,
+    return _make_result(fs=fs, path=url, url=url, findings=findings,
                          auth="anonymous", notes=notes)
 
 
 def _build_fsspec_https(headers):
+    """Returns (fs, error) -- exactly one of which is not-None/None.
+    ``error`` is the exception itself (never swallowed into a guessed
+    message) so callers can report what actually happened.
+    """
     kwargs = {}
     if headers:
         kwargs["client_kwargs"] = {"headers": headers}
     try:
-        return fsspec.filesystem("https", **kwargs)
-    except Exception:
-        # e.g. aiohttp not installed -- findings/metadata remain usable
-        # even without a live fs.
-        return None
+        return fsspec.filesystem("https", **kwargs), None
+    except Exception as e:
+        # findings/metadata remain usable even without a live fs.
+        return None, e
+
+
+def _fs_build_remediation(build_error):
+    if isinstance(build_error, (ImportError, ModuleNotFoundError)):
+        return "pip install aiohttp (or fsspec[http])."
+    return None
