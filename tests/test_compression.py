@@ -239,5 +239,34 @@ class AssessCompressionTests(unittest.TestCase):
         self.assertTrue(any("64" in n for n in out["notes"]))
 
 
+# --------------------------------------------------- keepbits_for_max_abs_error
+
+class KeepbitsForMaxAbsErrorTests(unittest.TestCase):
+    def test_smaller_error_target_needs_more_keepbits(self):
+        sample = np.linspace(1.0, 100.0, 1000).astype("f4")
+        loose = compression.keepbits_for_max_abs_error(sample, 1.0)
+        tight = compression.keepbits_for_max_abs_error(sample, 0.001)
+        self.assertLess(loose, tight)
+        self.assertLessEqual(tight, np.finfo(np.float32).nmant)
+
+    def test_nonpositive_error_returns_full_mantissa(self):
+        sample = np.array([1.0, 2.0], dtype="f4")
+        self.assertEqual(compression.keepbits_for_max_abs_error(sample, 0.0),
+                          np.finfo(np.float32).nmant)
+
+    def test_all_zero_sample_returns_zero(self):
+        sample = np.zeros(10, dtype="f4")
+        self.assertEqual(compression.keepbits_for_max_abs_error(sample, 0.01), 0)
+
+    def test_empty_sample_returns_zero(self):
+        sample = np.array([], dtype="f4")
+        self.assertEqual(compression.keepbits_for_max_abs_error(sample, 0.01), 0)
+
+    def test_clamped_to_dtype_mantissa_width(self):
+        sample = np.array([1.0], dtype="f4")
+        k = compression.keepbits_for_max_abs_error(sample, 1e-30)
+        self.assertEqual(k, np.finfo(np.float32).nmant)
+
+
 if __name__ == "__main__":
     unittest.main()

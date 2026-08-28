@@ -296,5 +296,30 @@ class TestFormatInventoryTable(unittest.TestCase):
         self.assertEqual(format_inventory_table([]), "")
 
 
+class TestParseSelection(unittest.TestCase):
+    def test_all_returns_every_name(self):
+        self.assertEqual(inv.parse_selection(NISAR_LIKE, "all"),
+                          [v["name"] for v in NISAR_LIKE])
+        self.assertEqual(inv.parse_selection(NISAR_LIKE, "ALL"),
+                          [v["name"] for v in NISAR_LIKE])
+
+    def test_numeric_index_resolves_to_name(self):
+        self.assertEqual(inv.parse_selection(NISAR_LIKE, "0"), [NISAR_LIKE[0]["name"]])
+
+    def test_comma_separated_mix_of_index_and_name(self):
+        tokens = inv.parse_selection(NISAR_LIKE, f"0, {NISAR_LIKE[1]['name']}")
+        self.assertEqual(tokens, [NISAR_LIKE[0]["name"], NISAR_LIKE[1]["name"]])
+
+    def test_out_of_range_index_passed_through_as_literal_token(self):
+        # Not a valid index into the inventory -> treated as a literal
+        # name/substring token for match_variables to resolve (and
+        # potentially raise VariableMatchError on).
+        tokens = inv.parse_selection(NISAR_LIKE, "999")
+        self.assertEqual(tokens, ["999"])
+
+    def test_blank_parts_ignored(self):
+        self.assertEqual(inv.parse_selection(NISAR_LIKE, "0,,"), [NISAR_LIKE[0]["name"]])
+
+
 if __name__ == "__main__":
     unittest.main()

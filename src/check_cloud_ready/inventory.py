@@ -179,6 +179,29 @@ def rank_variables(inventory: list[dict]) -> list[dict]:
 
 # -------------------------------------------------------------------- display
 
+def parse_selection(inventory: list[dict], raw: str) -> list[str]:
+    """Task 12 CLI helper: turn a raw ``--variables``-prompt answer
+    (comma-separated mix of 0-based ``format_inventory_table`` indices
+    and ``match_variables``-style name/path/substring tokens, or the
+    literal ``"all"``) into a list of tokens suitable for
+    ``match_variables``. Pure/no I/O, kept here since it is inventory
+    selection semantics, not CLI orchestration.
+    """
+    raw = raw.strip()
+    if raw.lower() == "all":
+        return [v["name"] for v in inventory]
+    tokens = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.isdigit() and int(part) < len(inventory):
+            tokens.append(inventory[int(part)]["name"])
+        else:
+            tokens.append(part)
+    return tokens
+
+
 def format_inventory_table(inventory: list[dict]) -> str:
     """Numbered plain-text table (index, name, dims x shape, dtype) for
     the CLI's --variables prompt. Deliberately dumb: no column

@@ -86,6 +86,13 @@ class AccessResult:
     findings: list      # check-dicts (Dimension D evidence)
     auth: str
     notes: list = field(default_factory=list)
+    # Additive (Task 12): raw CMR UMM-JSON for the resolved granule, or
+    # None when this input never resolved through CMR (a direct URL, a
+    # local path, or a granule ID that didn't resolve). The CLI
+    # orchestrator translates this into scoring.py's `cmr_meta` shape
+    # (License/DOI/ContactPersons/RelatedUrls/ScienceKeywords/Abstract)
+    # -- this module only carries the raw document through.
+    cmr_umm: Any = None
 
 
 # fs=None is only valid for these auth values (see AccessResult docstring,
@@ -94,11 +101,11 @@ class AccessResult:
 _FS_NONE_ALLOWED_AUTH = {"local", "no-network", "error"}
 
 
-def _make_result(fs, path, url, findings, auth, notes):
+def _make_result(fs, path, url, findings, auth, notes, cmr_umm=None):
     if fs is None and auth not in _FS_NONE_ALLOWED_AUTH:
         auth = "error"
     return AccessResult(fs=fs, path=path, url=url, findings=findings,
-                         auth=auth, notes=notes)
+                         auth=auth, notes=notes, cmr_umm=cmr_umm)
 
 
 # --------------------------------------------------------------- findings
@@ -240,6 +247,7 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
     credentials_url = result.get("credentials_url")
     s3_urls = result.get("s3_urls") or []
     https_urls = result.get("https_urls") or []
+    cmr_umm = result.get("umm")
 
     url = None
     if len(s3_urls) == 1:
@@ -262,7 +270,7 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
                              findings=findings, auth="error", notes=notes)
 
     if not url.startswith("s3://"):
-        return _resolve_https(url, findings=findings, notes=notes)
+        return _resolve_https(url, findings=findings, notes=notes, cmr_umm=cmr_umm)
 
     try:
         fs, path = nasa_s3.get_fs(url, credentials_url=credentials_url,
@@ -270,14 +278,14 @@ def _resolve_from_granule(granule_id, *, prompter, earthaccess_fallback,
     except Exception as e:
         _append_s3_error_finding(findings, e)
         return _make_result(fs=None, path=url, url=url, findings=findings,
-                             auth="error", notes=notes)
+                             auth="error", notes=notes, cmr_umm=cmr_umm)
 
     findings.append(_finding(
         "D2-auth", "D", "pass",
         f"S3 access resolved via CMR credentials endpoint {credentials_url}.",
     ))
     return _make_result(fs=fs, path=path, url=url, findings=findings,
-                         auth="obstore-cmr", notes=notes)
+                         auth="obstore-cmr", notes=notes, cmr_umm=cmr_umm)
 
 
 # ------------------------------------------------------------------- s3 path
@@ -458,12 +466,12 @@ def _maybe_earthaccess_fallback(url, prompter, earthaccess_fallback, findings, n
 
 # ----------------------------------------------------------------- https path
 
-def _resolve_https(url, *, findings, notes):
+def _resolve_https(url, *, findings, notes, cmr_umm=None):
     probe_result = probe.probe_https(url)
     findings.append(_range_finding(probe_result))
 
     if probe_result.get("classification") != "auth-required":
-        return _plain_https_fs(url, findings, notes)
+        return _plain_https_fs(url, findings, notes, cmr_umm=cmr_umm)
 
     notes.append("HTTPS endpoint requires Earthdata Login (401/403 or URS redirect detected).")
 
@@ -480,7 +488,7 @@ def _resolve_https(url, *, findings, notes):
                         "urs.earthdata.nasa.gov, then retry."),
         ))
         return _make_result(fs=None, path=url, url=url, findings=findings,
-                             auth="error", notes=notes)
+                             auth="error", notes=notes, cmr_umm=cmr_umm)
 
     fs, build_error = _build_fsspec_https(headers={"Authorization": f"Bearer {token}"})
     if fs is None:
@@ -496,10 +504,10 @@ def _resolve_https(url, *, findings, notes):
             "HTTPS access authenticated via an Earthdata Login bearer token.",
         ))
     return _make_result(fs=fs, path=url, url=url, findings=findings,
-                         auth="edl-bearer", notes=notes)
+                         auth="edl-bearer", notes=notes, cmr_umm=cmr_umm)
 
 
-def _plain_https_fs(url, findings, notes):
+def _plain_https_fs(url, findings, notes, cmr_umm=None):
     fs, build_error = _build_fsspec_https(headers=None)
     if fs is None:
         findings.append(_finding(
@@ -508,7 +516,7 @@ def _plain_https_fs(url, findings, notes):
             remediation=_fs_build_remediation(build_error),
         ))
     return _make_result(fs=fs, path=url, url=url, findings=findings,
-                         auth="anonymous", notes=notes)
+                         auth="anonymous", notes=notes, cmr_umm=cmr_umm)
 
 
 def _build_fsspec_https(headers):

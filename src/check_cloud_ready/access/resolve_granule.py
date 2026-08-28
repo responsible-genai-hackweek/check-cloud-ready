@@ -98,6 +98,11 @@ def resolve(granule_id):
     result = parse_related_urls(umm)
     result["granule_id"] = granule_id
     result["provider"] = granule_id.rsplit("-", 1)[-1]
+    # Raw UMM-JSON, additive (Task 12): access/workflow.py threads this
+    # through as AccessResult.cmr_umm so the CLI orchestrator can derive
+    # scoring.py's E3-E7 `cmr_meta` shape (License/DOI/ContactPersons/
+    # RelatedUrls/ScienceKeywords/Abstract) without a second CMR fetch.
+    result["umm"] = umm
 
     if result["credentials_url"] is None:
         note("no S3 credentials endpoint in CMR metadata — "

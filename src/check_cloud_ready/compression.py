@@ -37,13 +37,14 @@ already obtained (e.g. via ``chunking.pick_interior_chunks`` +
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from typing import Any
 
 import numpy as np
 
-__all__ = ["inspect_codec", "benchmark", "assess_compression"]
+__all__ = ["inspect_codec", "benchmark", "assess_compression", "keepbits_for_max_abs_error"]
 
 # --------------------------------------------------------------- soft imports
 
@@ -327,6 +328,38 @@ def benchmark(data: "np.ndarray", current_codec: str | None, *,
                         "error": "BitRound unavailable in installed numcodecs"})
 
     return rows
+
+
+def keepbits_for_max_abs_error(sample: "np.ndarray", max_abs_error: float) -> int:
+    """Map a user-supplied ``--bitround-max-abs-error`` target to a
+    BitRound ``keepbits`` mantissa-bit count for ``sample``'s dtype.
+
+    IEEE-754 rounding bound: truncating a float to ``k`` mantissa bits
+    bounds the relative rounding error to ~``2**-(k+1)``. Solving for
+    ``k`` against ``sample``'s largest magnitude gives the minimum
+    ``keepbits`` that keeps the absolute error at or below
+    ``max_abs_error`` for values near that peak (a conservative choice:
+    smaller-magnitude values in the same sample get an even smaller
+    absolute error at the same ``keepbits``). Clamped to
+    ``[0, mantissa bits of sample's dtype]`` (23 for float32, 52 for
+    float64; non-floating dtypes fall back to 23).
+
+    ``max_abs_error <= 0`` (no meaningful lossy budget) or an
+    all-zero/empty sample returns the dtype's full mantissa width or 0
+    respectively -- both safe, lossless-equivalent edges rather than a
+    division/log error.
+    """
+    arr = np.asarray(sample)
+    max_mantissa = (np.finfo(arr.dtype).nmant if np.issubdtype(arr.dtype, np.floating) else 23)
+    if max_abs_error <= 0:
+        return max_mantissa
+    if arr.size == 0:
+        return 0
+    peak = float(np.nanmax(np.abs(arr)))
+    if peak <= 0:
+        return 0
+    k = math.ceil(math.log2(peak) - math.log2(max_abs_error)) - 1
+    return max(0, min(max_mantissa, k))
 
 
 # ------------------------------------------------------- assess_compression
