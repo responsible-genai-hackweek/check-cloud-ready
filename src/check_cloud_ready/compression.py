@@ -134,31 +134,57 @@ def _reproduce_current_codec(current_codec: str | None, itemsize: int):
     codecs list (the stored/no-op baseline), which is a *supported*
     outcome, not "exotic" -- distinct from an unrecognized non-empty
     string like "lzf".
+
+    Two codec-string grammars are accepted, since ``openers.py`` emits
+    different shapes per format:
+
+    - A plain/hyphenated grammar, e.g. HDF5's ``"gzip"``/``"gzip+shuffle"``
+      (``ds.compression`` + a "+shuffle" suffix -- no level info at all)
+      or a hyphenated shorthand like ``"blosc-zstd-3+shuffle"``.
+    - numcodecs/zarr ``repr()``-style strings -- what
+      ``_zarr_array_record`` actually produces (``",".join(str(c) for c
+      in filters+compressors)``), e.g.
+      ``"Blosc(cname='zstd', clevel=3, shuffle=SHUFFLE, blocksize=0)"``
+      (a v2 zarr store's numcodecs compressor) or
+      ``"ZstdCodec(level=3, checksum=False)"`` /
+      ``"BloscCodec(..., cname='lz4', clevel=5, shuffle='noshuffle', ...)"``
+      (zarr v3's native codec classes). These are parsed by extracting
+      ``cname=``/``clevel=``/``level=`` key-value pairs rather than by
+      hyphen position.
     """
     if current_codec is None or str(current_codec).strip().lower() in _UNCOMPRESSED_STRINGS:
         return [], "uncompressed"
 
     s = current_codec
     sl = s.lower()
+    # Works for both grammars: hyphenated "...+shuffle"/plain (no
+    # "noshuffle" text) and repr-style "shuffle=SHUFFLE"/"shuffle='shuffle'"
+    # (vs "shuffle=NOSHUFFLE"/"shuffle='noshuffle'") -- in every case the
+    # literal substring "noshuffle" only ever appears when shuffle is off.
     want_shuffle = "shuffle" in sl and "noshuffle" not in sl
 
-    m = re.search(r"blosc-(lz4|zstd)(?:[-(](\d+)\)?)?", sl)
-    if m:
-        cname = m.group(1)
-        level = int(m.group(2)) if m.group(2) else (5 if cname == "lz4" else 3)
+    if "blosc" in sl:
+        # cname/clevel: try repr-style key=value first ("cname='zstd'",
+        # "clevel=3"), then fall back to the hyphenated grammar
+        # ("blosc-zstd-3").
+        cname_m = re.search(r"cname=['\"]?(\w+)", sl) or re.search(r"blosc-(lz4|zstd)", sl)
+        cname = cname_m.group(1) if cname_m else "zstd"
+        level_m = re.search(r"clevel=(\d+)", sl) or re.search(rf"blosc-{cname}-(\d+)", sl)
+        level = int(level_m.group(1)) if level_m else (5 if cname == "lz4" else 3)
         shuffle_mode = numcodecs.Blosc.SHUFFLE if want_shuffle else numcodecs.Blosc.NOSHUFFLE
         return [numcodecs.Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)], s
 
-    m = re.search(r"zstd(?:[-(](\d+)\)?)?", sl)
-    if m and "blosc" not in sl:
-        level = int(m.group(1)) if m.group(1) else 3
+    if "zstd" in sl:
+        level_m = (re.search(r"level=(\d+)", sl) or re.search(r"clevel=(\d+)", sl)
+                   or re.search(r"zstd[-_(]?(\d+)", sl))
+        level = int(level_m.group(1)) if level_m else 3
         codecs = [numcodecs.Shuffle(itemsize)] if want_shuffle else []
         codecs.append(numcodecs.Zstd(level=level))
         return codecs, s
 
-    m = re.search(r"gzip(?:[-(](\d+)\)?)?", sl)
-    if m:
-        level = int(m.group(1)) if m.group(1) else 4  # "level from file if known else 4"
+    if "gzip" in sl or "zlib" in sl or "deflate" in sl:
+        level_m = re.search(r"level=(\d+)", sl)
+        level = int(level_m.group(1)) if level_m else 4  # "level from file if known else 4"
         codecs = [numcodecs.Shuffle(itemsize)] if want_shuffle else []
         codecs.append(numcodecs.Zlib(level=level))
         return codecs, s

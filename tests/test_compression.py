@@ -114,6 +114,49 @@ class BenchmarkTests(unittest.TestCase):
         # shuffle and no-shuffle variants both present
         self.assertTrue(any("shuffle" in c and "noshuffle" not in c for c in configs))
 
+    def test_current_codec_zarr_v2_numcodecs_blosc_repr_reproduced(self):
+        # Realistic string: what openers.py's _zarr_array_record actually
+        # emits for a v2 zarr store (",".join(str(c) for c in
+        # filters+compressors)) when the compressor is a numcodecs Blosc
+        # instance -- e.g. Blosc(cname='zstd', clevel=3,
+        # shuffle=SHUFFLE, blocksize=0). This must reproduce (not fall
+        # back to the "cannot reproduce locally" placeholder) -- Blosc
+        # is the single most common real-world Zarr codec.
+        data = _big_array()
+        codec_str = "Blosc(cname='zstd', clevel=3, shuffle=SHUFFLE, blocksize=0)"
+        rows = benchmark(data, current_codec=codec_str)
+        row0 = rows[0]
+        self.assertTrue(row0.get("is_current"))
+        self.assertNotIn("error", row0)
+        self.assertIn(codec_str, row0["config"])
+        self.assertIsNotNone(row0.get("ratio"))
+        self.assertGreater(row0["ratio"], 0)
+
+    def test_current_codec_zarr_v3_native_zstd_codec_repr_reproduced(self):
+        # zarr v3's native codec classes have a different repr shape
+        # again (no "cname"/"clevel", just "level=") -- e.g.
+        # ZstdCodec(level=3, checksum=False).
+        data = _big_array()
+        rows = benchmark(data, current_codec="ZstdCodec(level=3, checksum=False)")
+        row0 = rows[0]
+        self.assertTrue(row0.get("is_current"))
+        self.assertNotIn("error", row0)
+        self.assertIsNotNone(row0.get("ratio"))
+        self.assertGreater(row0["ratio"], 0)
+
+    def test_current_codec_gzip_with_shuffle_hdf5_style_reproduced(self):
+        # openers.py's HDF5 codec string: ds.compression + "+shuffle" if
+        # ds.shuffle -- no level info at all, so this exercises the
+        # default-level-4 path together with the shuffle prefix codec.
+        data = _big_array()
+        rows = benchmark(data, current_codec="gzip+shuffle")
+        row0 = rows[0]
+        self.assertTrue(row0.get("is_current"))
+        self.assertNotIn("error", row0)
+        self.assertIn("gzip", row0["config"].lower())
+        self.assertIsNotNone(row0.get("ratio"))
+        self.assertGreater(row0["ratio"], 0)
+
     def test_current_codec_none_is_uncompressed_baseline(self):
         data = _big_array()
         rows = benchmark(data, current_codec=None)
