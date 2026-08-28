@@ -172,6 +172,127 @@ class CheckCFShapeTests(unittest.TestCase):
             self.assertIn(c["ok"], (True, False, None))
 
 
+# ----------------------------------------- Finding 1: axis/_CoordinateAxisType
+# and `coordinates`-attribute auxiliary-coordinate resolution.
+
+class CheckCFAxisHintTests(unittest.TestCase):
+    def test_axis_z_identifies_vertical_coordinate_regardless_of_name(self):
+        # "elevation" matches no common coordinate name, but axis="Z"
+        # is itself a valid CF coordinate-identification signal.
+        variables = [
+            {"name": "/elevation", "dims": ["elevation"], "shape": [3],
+             "dtype": "float32", "chunks": None,
+             "attrs": {"axis": "Z", "units": "m"},
+             "size_bytes": None, "codec": None},
+        ]
+        out = check_cf(variables, {"Conventions": "CF-1.7"})
+        checks = _checks_by_id(out)
+        self.assertTrue(checks["coordinate_identification"]["ok"])
+        self.assertIn("/elevation", checks["coordinate_identification"]["evidence"])
+
+    def test_coordinate_axis_type_identifies_time_regardless_of_name(self):
+        # Named "T" (not "time"), but _CoordinateAxisType="Time" is a
+        # valid identification signal per conventions.md.
+        variables = [
+            {"name": "/T", "dims": ["T"], "shape": [5], "dtype": "float64",
+             "chunks": None,
+             "attrs": {"_CoordinateAxisType": "Time", "units": "hours since 2000-01-01"},
+             "size_bytes": None, "codec": None},
+        ]
+        out = check_cf(variables, {"Conventions": "CF-1.7"})
+        checks = _checks_by_id(out)
+        self.assertTrue(checks["coordinate_identification"]["ok"])
+        self.assertIn("time", checks["coordinate_identification"]["evidence"].lower())
+
+    def test_axis_hint_present_but_time_units_still_missing_since_fails(self):
+        variables = [
+            {"name": "/T", "dims": ["T"], "shape": [5], "dtype": "float64",
+             "chunks": None,
+             "attrs": {"axis": "T", "units": "hours"},  # no "since ..."
+             "size_bytes": None, "codec": None},
+        ]
+        out = check_cf(variables, {"Conventions": "CF-1.7"})
+        checks = _checks_by_id(out)
+        self.assertFalse(checks["coordinate_identification"]["ok"])
+        self.assertIn("/T", checks["coordinate_identification"]["evidence"])
+
+
+class CheckCFAuxiliaryCoordinatesTests(unittest.TestCase):
+    def test_coordinates_attr_resolves_to_existing_variables(self):
+        variables, global_attrs = _cmip_like()
+        for v in variables:
+            if v["name"] == "/tas":
+                v["attrs"]["coordinates"] = "lat lon"
+        out = check_cf(variables, global_attrs)
+        checks = _checks_by_id(out)
+        self.assertTrue(checks["coordinate_identification"]["ok"])
+        self.assertIn("lat", checks["coordinate_identification"]["evidence"])
+
+    def test_coordinates_attr_dangling_reference_fails(self):
+        variables, global_attrs = _cmip_like()
+        for v in variables:
+            if v["name"] == "/tas":
+                v["attrs"]["coordinates"] = "lat lon height_above_ground"
+        out = check_cf(variables, global_attrs)
+        checks = _checks_by_id(out)
+        self.assertFalse(checks["coordinate_identification"]["ok"])
+        self.assertIn("height_above_ground", checks["coordinate_identification"]["evidence"])
+
+
+# --------------------------------------------- Finding 2: scale_factor/add_offset
+
+class CheckCFScaleOffsetTests(unittest.TestCase):
+    def test_absent_scale_offset_is_not_applicable(self):
+        variables, global_attrs = _cmip_like()
+        out = check_cf(variables, global_attrs)
+        checks = _checks_by_id(out)
+        self.assertIsNone(checks["scale_offset_typing"]["ok"])
+
+    def test_numeric_scale_and_offset_pass(self):
+        variables, global_attrs = _cmip_like()
+        for v in variables:
+            if v["name"] == "/tas":
+                v["attrs"]["scale_factor"] = 0.01
+                v["attrs"]["add_offset"] = 273.15
+        out = check_cf(variables, global_attrs)
+        checks = _checks_by_id(out)
+        self.assertTrue(checks["scale_offset_typing"]["ok"])
+
+    def test_stringly_typed_scale_factor_fails(self):
+        variables, global_attrs = _cmip_like()
+        for v in variables:
+            if v["name"] == "/tas":
+                v["attrs"]["scale_factor"] = "0.01"  # wrong type: should be numeric
+        out = check_cf(variables, global_attrs)
+        checks = _checks_by_id(out)
+        self.assertFalse(checks["scale_offset_typing"]["ok"])
+        self.assertIn("/tas", checks["scale_offset_typing"]["evidence"])
+        self.assertIn("scale_factor", checks["scale_offset_typing"]["evidence"])
+
+
+# --------------------------------------------- Finding 3: "fail" rollup state
+
+class CheckCFFailRollupTests(unittest.TestCase):
+    def test_no_cf_signal_at_all_is_fail(self):
+        # Attrs are present (non-empty) so this isn't the "skipped"
+        # case, but nothing in them is CF-shaped at all: no
+        # Conventions, no units/standard_name/long_name, no
+        # coordinate-like variables, no grid_mapping/CRS container, no
+        # fill-value/scale-offset/bounds attrs.
+        variables = [
+            {"name": "/some_measurement", "dims": ["sample"], "shape": [10],
+             "dtype": "float32", "chunks": None,
+             "attrs": {"some_unrelated_attr": "1"},
+             "size_bytes": None, "codec": None},
+        ]
+        out = check_cf(variables, {})
+        self.assertEqual(out["status"], "fail")
+        checks = _checks_by_id(out)
+        self.assertFalse(checks["conventions_attr"]["ok"])
+        self.assertFalse(checks["units_and_name"]["ok"])
+        self.assertIn("no CF signal", "; ".join(out["notes"]))
+
+
 # ------------------------------------------------------------- check_geozarr
 
 def _zmetadata_bytes(metadata: dict) -> bytes:

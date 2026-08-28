@@ -48,6 +48,15 @@ _LON_NAMES = {"lon", "longitude"}
 _TIME_NAMES = {"time"}
 _CRS_CONTAINER_NAMES = {"projection", "crs", "spatial_ref"}
 
+# CF `axis` values (case-insensitive) and the netCDF-Java/THREDDS
+# `_CoordinateAxisType` convention -- both are additional coordinate-
+# identification hints conventions.md calls out alongside name/
+# standard_name matching.
+_AXIS_VALUES = {"t", "x", "y", "z"}
+_COORD_AXIS_TYPE_TIME = {"time"}
+_COORD_AXIS_TYPE_LAT = {"lat", "latitude"}
+_COORD_AXIS_TYPE_LON = {"lon", "longitude"}
+
 _SINCE_RE = re.compile(r"\bsince\b", re.IGNORECASE)
 _CF_VERSION_RE = re.compile(r"CF[- ]?(\d+(?:\.\d+)?)", re.IGNORECASE)
 
@@ -59,12 +68,20 @@ def _basename(name: str) -> str:
 def _is_coordinate_var(v: dict) -> bool:
     """A variable is coordinate-like if its own (base)name is one of
     its declared dims (the classic netCDF coordinate-variable
-    convention) or a common coordinate name."""
+    convention), a common coordinate name, or it carries an explicit
+    `axis` (T/X/Y/Z) or `_CoordinateAxisType` attribute -- either of
+    which identifies a variable as a coordinate regardless of its
+    name."""
     base = _basename(v.get("name", ""))
     dims = v.get("dims") or []
+    attrs = v.get("attrs") or {}
     if base in dims:
         return True
     if base.lower() in _COMMON_COORD_NAMES:
+        return True
+    if str(attrs.get("axis") or "").strip().lower() in _AXIS_VALUES:
+        return True
+    if attrs.get("_CoordinateAxisType"):
         return True
     return False
 
@@ -140,43 +157,103 @@ def _check_units_and_name(variables: list[dict]) -> dict:
                         "standard_name/long_name"}
 
 
+def _classify_coord_kind(base: str, std: str, axis: str, coord_axis_type: str) -> str:
+    """Classify a coordinate-like variable as time/latitude/longitude/
+    vertical/generic, using -- in order -- its (base)name, its
+    `standard_name`, its CF `axis` value, and the netCDF-Java
+    `_CoordinateAxisType` convention. Any one of these four signals is
+    sufficient (conventions.md lists all four as valid identification
+    hints, not just name/standard_name)."""
+    if base in _TIME_NAMES or std == "time" or axis == "t" or coord_axis_type in _COORD_AXIS_TYPE_TIME:
+        return "time"
+    if base in _LAT_NAMES or std == "latitude" or axis == "y" or coord_axis_type in _COORD_AXIS_TYPE_LAT:
+        return "latitude"
+    if base in _LON_NAMES or std == "longitude" or axis == "x" or coord_axis_type in _COORD_AXIS_TYPE_LON:
+        return "longitude"
+    if axis == "z":
+        return "vertical"
+    if coord_axis_type and coord_axis_type not in (
+            _COORD_AXIS_TYPE_TIME | _COORD_AXIS_TYPE_LAT | _COORD_AXIS_TYPE_LON):
+        # Any other non-empty, unrecognized _CoordinateAxisType value
+        # (e.g. "GeoZ", "Height", "Pressure") is treated as a generic
+        # vertical/other coordinate hint.
+        return "vertical"
+    return "generic"
+
+
 def _check_coordinate_identification(variables: list[dict]) -> dict:
+    by_name, by_basename = _name_lookup(variables)
     coord_vars = [v for v in variables if _is_coordinate_var(v)]
-    if not coord_vars:
+    has_coordinates_attr = any((v.get("attrs") or {}).get("coordinates") for v in variables)
+
+    if not coord_vars and not has_coordinates_attr:
         return {"id": "coordinate_identification", "ok": None,
-                "evidence": "no coordinate-like variables found"}
+                "evidence": "no coordinate-like variables or `coordinates` attributes "
+                            "found"}
+
     problems = []
     identified = []
+
     for v in coord_vars:
         base = _basename(v["name"]).lower()
         attrs = v.get("attrs") or {}
         units = str(attrs.get("units") or "")
         std = str(attrs.get("standard_name") or "").lower()
-        if base in _TIME_NAMES or std == "time":
+        axis = str(attrs.get("axis") or "").strip().lower()
+        coord_axis_type = str(attrs.get("_CoordinateAxisType") or "").strip().lower()
+        hint = ""
+        if attrs.get("axis"):
+            hint += f", axis={attrs.get('axis')!r}"
+        if attrs.get("_CoordinateAxisType"):
+            hint += f", _CoordinateAxisType={attrs.get('_CoordinateAxisType')!r}"
+
+        kind = _classify_coord_kind(base, std, axis, coord_axis_type)
+        if kind == "time":
             if _SINCE_RE.search(units):
                 identified.append(
                     f"{v['name']} (time; units={units!r}, calendar="
-                    f"{attrs.get('calendar', 'unspecified')!r})")
+                    f"{attrs.get('calendar', 'unspecified')!r}{hint})")
             else:
                 problems.append(
                     f"{v['name']} looks like a time coordinate but units {units!r} "
-                    "lack a '<t> since ...' reference")
-        elif base in _LAT_NAMES or std == "latitude":
-            if "degree" in units.lower() or std == "latitude":
-                identified.append(f"{v['name']} (latitude; units={units!r})")
+                    f"lack a '<t> since ...' reference{hint}")
+        elif kind == "latitude":
+            if "degree" in units.lower() or std == "latitude" or coord_axis_type in _COORD_AXIS_TYPE_LAT:
+                identified.append(f"{v['name']} (latitude; units={units!r}{hint})")
             else:
                 problems.append(
                     f"{v['name']} looks like latitude but has no degrees units or "
-                    "latitude standard_name")
-        elif base in _LON_NAMES or std == "longitude":
-            if "degree" in units.lower() or std == "longitude":
-                identified.append(f"{v['name']} (longitude; units={units!r})")
+                    f"latitude standard_name{hint}")
+        elif kind == "longitude":
+            if "degree" in units.lower() or std == "longitude" or coord_axis_type in _COORD_AXIS_TYPE_LON:
+                identified.append(f"{v['name']} (longitude; units={units!r}{hint})")
             else:
                 problems.append(
                     f"{v['name']} looks like longitude but has no degrees units or "
-                    "longitude standard_name")
+                    f"longitude standard_name{hint}")
+        elif kind == "vertical":
+            identified.append(
+                f"{v['name']} (vertical/other coordinate, identified via axis/"
+                f"_CoordinateAxisType hint{hint})")
         else:
             identified.append(f"{v['name']} (coordinate)")
+
+    # Auxiliary coordinates: any variable's `coordinates` attribute
+    # (space-separated variable names, per CF) must resolve against
+    # other inventory records -- reuse the same name-resolution
+    # machinery `grid_mapping`/`bounds` already use.
+    for v in variables:
+        coords_attr = (v.get("attrs") or {}).get("coordinates")
+        if not coords_attr:
+            continue
+        for token in str(coords_attr).split():
+            if _resolves(token, by_name, by_basename):
+                identified.append(f"{v['name']}.coordinates -> {token}")
+            else:
+                problems.append(
+                    f"{v['name']} coordinates={coords_attr!r} references {token!r} "
+                    "which does not resolve to any variable in the inventory")
+
     if problems:
         return {"id": "coordinate_identification", "ok": False, "evidence": "; ".join(problems)}
     return {"id": "coordinate_identification", "ok": True, "evidence": "; ".join(identified)}
@@ -248,6 +325,36 @@ def _check_fill_value_consistency(variables: list[dict]) -> dict:
             "evidence": f"{checked} variable(s) with consistent _FillValue/missing_value"}
 
 
+def _check_scale_offset_typing(variables: list[dict]) -> dict:
+    """conventions.md's fill-value bullet also requires
+    ``scale_factor``/``add_offset`` to be "typed correctly" -- CF
+    requires these to be numeric (matching, or safely castable to, the
+    packed variable's dtype); this checks the minimal, unambiguous
+    part of that: are they numeric at all, not e.g. a stringly-typed
+    value that would break unpacking (``unpacked = packed *
+    scale_factor + add_offset``)."""
+    checked = 0
+    problems = []
+    for v in variables:
+        attrs = v.get("attrs") or {}
+        for key in ("scale_factor", "add_offset"):
+            val = attrs.get(key)
+            if val is None:
+                continue
+            checked += 1
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                problems.append(
+                    f"{v['name']}: {key}={val!r} is not numeric (type "
+                    f"{type(val).__name__})")
+    if checked == 0:
+        return {"id": "scale_offset_typing", "ok": None,
+                "evidence": "no scale_factor/add_offset attributes present"}
+    if problems:
+        return {"id": "scale_offset_typing", "ok": False, "evidence": "; ".join(problems)}
+    return {"id": "scale_offset_typing", "ok": True,
+            "evidence": f"{checked} scale_factor/add_offset attribute(s) numerically typed"}
+
+
 def _check_bounds(variables: list[dict]) -> dict:
     by_name, by_basename = _name_lookup(variables)
     refs = [(v, v.get("attrs", {}).get("bounds")) for v in variables
@@ -266,12 +373,18 @@ def _check_bounds(variables: list[dict]) -> dict:
     return {"id": "bounds", "ok": True, "evidence": "; ".join(resolved)}
 
 
-_CF_CHECK_FUNCS = (
-    _check_conventions_attr,  # global_attrs
+# Checks that take `global_attrs` vs. checks that take `variables` --
+# `check_cf` builds its `checks` list from exactly these two registries
+# (no separate inline duplicate of "which checks run").
+_GLOBAL_ATTRS_CHECKS = (
+    _check_conventions_attr,
+)
+_VARIABLES_CHECKS = (
     _check_units_and_name,
     _check_coordinate_identification,
     _check_grid_mapping,
     _check_fill_value_consistency,
+    _check_scale_offset_typing,
     _check_bounds,
 )
 
@@ -298,14 +411,8 @@ def check_cf(variables: list[dict], global_attrs: dict) -> dict:
     global_attrs = global_attrs or {}
     any_attrs = bool(global_attrs) or any(v.get("attrs") for v in variables)
 
-    checks = [
-        _check_conventions_attr(global_attrs),
-        _check_units_and_name(variables),
-        _check_coordinate_identification(variables),
-        _check_grid_mapping(variables),
-        _check_fill_value_consistency(variables),
-        _check_bounds(variables),
-    ]
+    checks = ([f(global_attrs) for f in _GLOBAL_ATTRS_CHECKS]
+              + [f(variables) for f in _VARIABLES_CHECKS])
 
     if not any_attrs:
         return {"status": "skipped", "checks": checks,
@@ -344,17 +451,13 @@ def _cat(fs, path: str):
         return None
 
 
-def _exists(fs, path: str) -> bool:
-    try:
-        return fs.exists(path)
-    except Exception:
-        return False
-
-
 def _collect_zarr_meta(fs, root: str) -> dict:
     """Bounded, listing-free zarr metadata probe: works against any
-    fsspec-like fs exposing just ``.exists()``/``.cat_file()`` (the
-    same minimal surface ``formats.sniff_store`` requires).
+    fsspec-like fs exposing just ``.cat_file()`` -- a subset of the
+    minimal surface ``formats.sniff_store`` requires (that function
+    also uses ``.exists()``; this one never needs to, since every path
+    it might read is instead attempted directly via ``.cat_file()``
+    and treated as absent on any exception -- see ``_cat``).
 
     Consolidated metadata (zarr v3's ``zarr.json``
     ``consolidated_metadata``, or zarr v2's ``.zmetadata``) is
@@ -490,8 +593,9 @@ def _pseudo_inventory(arrays: dict) -> list[dict]:
 def check_geozarr(fs, root: str, *, zarr_meta: dict | None = None) -> dict:
     """GeoZarr forward-conformance check (zarr stores only,
     layout-level -- no rasterio). ``fs``/``root`` are used the same way
-    ``formats.sniff_store`` uses them (a listing-free metadata probe
-    over ``.exists()``/``.cat_file()``); pass ``zarr_meta`` (the shape
+    ``formats.sniff_store`` uses them -- a listing-free metadata probe,
+    though this one only ever needs ``.cat_file()`` (see
+    ``_collect_zarr_meta``); pass ``zarr_meta`` (the shape
     ``_collect_zarr_meta`` returns) to skip the fs probe entirely with
     already-collected metadata.
 
