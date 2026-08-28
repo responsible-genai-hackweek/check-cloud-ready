@@ -9,7 +9,7 @@ No I/O, no network.
 import copy
 import unittest
 
-from check_cloud_ready import scoring
+from check_cloud_ready import chunking, scoring
 
 score = scoring.score
 rollup_checks = scoring.rollup_checks
@@ -31,14 +31,23 @@ def _cf_none():
     return {"status": "skipped", "checks": [], "notes": ["attributes unavailable"]}
 
 
-def _profiles(status):
-    return {"interactive": {"status": status}, "training": {"status": status},
-            "agentic": {"status": status}}
-
-
-def _variable(name="/temp", within="within", shape=(1000, 1000), chunks=(200, 200)):
+def _variable(name="/temp", compressed_mb=8.0, shape=(1000, 1000), chunks=(200, 200)):
+    """Fixture-build one chunking-output-shaped variable dict the way
+    ``chunking.assess_chunking`` actually would for a given measured/
+    estimated compressed chunk size: both ``grade`` (the single scored
+    criterion C1/C2 now read -- fix round, final-review finding 1) and
+    ``profiles`` (the informational three-profile overlay, still used by
+    C3-agentic) are derived from the real ``chunking.grade()``/
+    ``chunking._build_profiles()`` functions, never a hand-picked status
+    string -- the pre-fix bug was exactly a fixture that set all three
+    profile statuses to the same value, a state real chunking output can
+    never produce for one chunk size (interactive/training bands are
+    disjoint), which masked C1/C2 never being independently satisfiable.
+    """
+    grade_band, grade_note = chunking.grade(compressed_mb)
     return {"name": name, "shape": list(shape), "chunks": list(chunks),
-            "profiles": _profiles(within)}
+            "grade": grade_band, "grade_note": grade_note,
+            "profiles": chunking._build_profiles(compressed_mb)}
 
 
 def _inspection_pass(name="/temp", codec="zstd"):
@@ -69,7 +78,7 @@ def _golden_zarr_asset():
             "metadata_walk": None,
         },
         "inventory": [{"name": "/temp", "attrs": {"units": "K"}}],
-        "chunking": {"variables": [_variable("/temp", "within", (1000, 1000), (400, 400))]},
+        "chunking": {"variables": [_variable("/temp", 8.0, (1000, 1000), (400, 400))]},
         "compression": {"inspection": [_inspection_pass("/temp", "zstd")]},
         "conventions": {"cf": _cf_pass()},
         "access_findings": [
@@ -101,14 +110,57 @@ class GoldenHappyPathTests(unittest.TestCase):
             self.assertIn(c["status"], ("pass",), msg=c)
 
 
+class GoodChunkSizeReachesReadyTests(unittest.TestCase):
+    """Regression guard for final-review finding 1: at the tool's own
+    advertised ~8 MB interactive/agentic sweet spot, real
+    ``chunking.grade()``/``chunking._build_profiles()`` output (not a
+    hand-picked/impossible profile-status fixture) fed through
+    ``scoring.score()`` on an otherwise-clean asset must reach READY at
+    a tier better than C.
+
+    Before the fix, C1-interactive/C2-training scored against the
+    three-profile overlay's disjoint interactive (1-4 MB) / training
+    (10-100 MB) ``"within"`` bands -- at 8 MB, real
+    ``chunking._build_profiles(8.0)`` yields interactive="above" and
+    training="below", so NEITHER profile check could ever read "within"
+    for this (or any single) chunk size. Both C1 and C2 scored "fail",
+    both are consumer-visible-fail ids, and the score/verdict were
+    force-capped to NOT READY / tier<=C regardless of how well-sized the
+    chunk actually was.
+    """
+
+    def test_8mb_sweet_spot_chunk_reaches_ready_above_tier_c(self):
+        grade_band, grade_note = chunking.grade(8.0)
+        self.assertEqual(grade_band, "pass")  # sanity: 8 MB is in the 4-16 MB pass band
+
+        asset = _golden_zarr_asset()
+        asset["chunking"] = {"variables": [{
+            "name": "/temp", "shape": [1000, 1000], "chunks": [400, 400],
+            "grade": grade_band, "grade_note": grade_note,
+            "profiles": chunking._build_profiles(8.0),
+        }]}
+
+        result = score(asset)
+
+        self.assertEqual(result["verdict"], "READY", msg=result["verdict_reason"])
+        self.assertNotIn(result["tier"], ("C", "D", "F"))
+        c1 = next(c for c in result["checks"] if c["id"] == "C1-interactive")
+        c2 = next(c for c in result["checks"] if c["id"] == "C2-training")
+        self.assertEqual(c1["status"], "pass")
+        self.assertEqual(c2["status"], "pass")
+        self.assertEqual(result["caps_applied"], [])
+
+
 class ChunkSizeFailTests(unittest.TestCase):
     """Scenario 2: chunk-size fail -> NOT READY, verdict_reason names
     chunking, cap applied, tier <= C even if raw sum were higher."""
 
     def test_chunk_fail_forces_not_ready_and_caps(self):
         asset = _golden_zarr_asset()
-        # Every dimension besides C stays at (near-)full marks; C1/C2 fail outright.
-        asset["chunking"] = {"variables": [_variable("/temp", "above", (1000, 1000),
+        # Every dimension besides C stays at (near-)full marks; C1/C2 fail
+        # outright: 0.5 MB compressed is squarely in chunking.grade()'s
+        # <1 MB "fail" band (too small, per-request overhead dominates).
+        asset["chunking"] = {"variables": [_variable("/temp", 0.5, (1000, 1000),
                                                        (1000, 1000))]}
         result = score(asset)
         self.assertEqual(result["verdict"], "NOT READY")
@@ -123,7 +175,7 @@ class ChunkSizeFailTests(unittest.TestCase):
 
     def test_verdict_reason_names_a_consumer_visible_check(self):
         asset = _golden_zarr_asset()
-        asset["chunking"] = {"variables": [_variable("/temp", "above")]}
+        asset["chunking"] = {"variables": [_variable("/temp", 0.5)]}
         result = score(asset)
         self.assertIn("C1-interactive", result["verdict_reason"])
 
@@ -246,7 +298,7 @@ class FailRemediationTests(unittest.TestCase):
     def test_every_fail_has_remediation(self):
         asset = _golden_zarr_asset()
         asset["format"] = "hdf4"
-        asset["chunking"] = {"variables": [_variable("/temp", "above")]}
+        asset["chunking"] = {"variables": [_variable("/temp", 0.5)]}
         asset["compression"] = {"inspection": [
             {"name": "/temp", "codec": None, "status": "fail",
              "note": "no compression", "remediation": None},
@@ -292,7 +344,7 @@ class FailRemediationTests(unittest.TestCase):
 
         b = _golden_zarr_asset()
         b["format"] = "hdf4"
-        b["chunking"] = {"variables": [_variable("/temp", "above")]}
+        b["chunking"] = {"variables": [_variable("/temp", 0.5)]}
         assets.append(b)
 
         for asset in assets:
@@ -374,6 +426,30 @@ class RollupChecksTests(unittest.TestCase):
         self.assertEqual(dims["B"]["score"], 20.0)
         self.assertEqual(dims["C"]["score"], 0.0)
         self.assertEqual(total, 50.0)
+
+
+class E1E2EtagTests(unittest.TestCase):
+    """Final-review finding 3: _e1_e2_checks itself already handled an
+    ``etag`` argument correctly -- the bug was that nothing upstream
+    (cli.py) ever populated ``asset["etag"]`` in the first place, so
+    these checks were permanently fail/partial regardless of what a
+    live probe served. Direct unit coverage of the check function's
+    etag-driven behavior, independent of the cli-level wiring test."""
+
+    def test_no_etag_is_fail(self):
+        e1, e2 = scoring._e1_e2_checks("zarr", None)
+        self.assertEqual(e1["status"], "fail")
+        self.assertEqual(e2["status"], "fail")
+
+    def test_strong_etag_is_non_fail_for_both(self):
+        e1, e2 = scoring._e1_e2_checks("zarr", '"abc123"')
+        self.assertNotEqual(e1["status"], "fail")
+        self.assertNotEqual(e2["status"], "fail")
+
+    def test_weak_etag_unblocks_e1_but_not_e2(self):
+        e1, e2 = scoring._e1_e2_checks("zarr", 'W/"abc123"')
+        self.assertNotEqual(e1["status"], "fail")
+        self.assertEqual(e2["status"], "fail")
 
 
 class VerdictForTests(unittest.TestCase):

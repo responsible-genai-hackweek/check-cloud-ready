@@ -431,23 +431,47 @@ def _profile_statuses(variables, profile):
     return out
 
 
+def _variable_grades(variables):
+    """The single, per-variable graded chunk-size band from
+    ``chunking.grade()`` (stored as ``variable["grade"]`` by
+    ``chunking.assess_chunking``) -- ``"pass"|"warn"|"fail"``, excluding
+    ``"unknown"``/missing (no measured or estimated compressed size).
+
+    C1/C2 (fix round, final-review finding 1) read THIS, not the
+    three-profile overlay's mutually-exclusive interactive/training
+    ``"within"`` bands: the plan mandates ``chunking.grade()`` as the
+    single scored chunk-size criterion, with the three-profile table
+    staying purely informational (never independently scored). Using
+    the profile overlay's ``"within"`` membership to gate C1/C2 meant no
+    single chunk size could ever satisfy both (their target bands are
+    disjoint: 1-4 MB vs 10-100 MB), which forced every measurable-chunk
+    asset to NOT READY/tier<=C regardless of actual chunk quality.
+    """
+    out = []
+    for v in variables:
+        g = v.get("grade")
+        if g and g != "unknown":
+            out.append(g)
+    return out
+
+
 def _c1_interactive_check(asset, fmt, variables):
-    statuses = _profile_statuses(variables, "interactive")
+    grades = _variable_grades(variables)
     open_ = asset.get("open") or {}
     fc = open_.get("format_checks") or {}
 
-    if not statuses:
+    if not grades:
         pts, status = 2.5, "skipped"
-        evid = "no measurable interactive chunk-size data"
-    elif all(s == "within" for s in statuses):
+        evid = "no measurable chunk-size grade data"
+    elif all(g == "pass" for g in grades):
         pts, status = 5.0, "pass"
-        evid = f"interactive fit within target for all {len(statuses)} measured variable(s)"
-    elif any(s == "within" for s in statuses):
-        pts, status = 2.0, "partial"
-        evid = f"interactive fit mixed across variables: {statuses[:5]}"
-    else:
+        evid = f"chunk size within the wire-target sweet spot for all {len(grades)} measured variable(s)"
+    elif all(g == "fail" for g in grades):
         pts, status = 0.0, "fail"
-        evid = f"interactive fit outside target for all measured variable(s): {statuses[:5]}"
+        evid = f"chunk size outside the universal band for all measured variable(s): {grades[:5]}"
+    else:
+        pts, status = 2.0, "partial"
+        evid = f"chunk size mixed/suboptimal across variables: {grades[:5]}"
 
     if fmt == "cog" and fc.get("overviews") == []:
         pts, status = 0.0, "fail"
@@ -458,19 +482,19 @@ def _c1_interactive_check(asset, fmt, variables):
 
 
 def _c2_training_check(variables):
-    statuses = _profile_statuses(variables, "training")
-    if not statuses:
+    grades = _variable_grades(variables)
+    if not grades:
         pts, status = 3.5, "skipped"
-        evid = "no measurable training chunk-size data"
-    elif all(s == "within" for s in statuses):
+        evid = "no measurable chunk-size grade data"
+    elif all(g == "pass" for g in grades):
         pts, status = 7.0, "pass"
-        evid = f"training fit within target for all {len(statuses)} measured variable(s)"
-    elif any(s == "within" for s in statuses):
-        pts, status = 2.8, "partial"
-        evid = f"training fit mixed across variables: {statuses[:5]}"
-    else:
+        evid = f"chunk size within the wire-target sweet spot for all {len(grades)} measured variable(s)"
+    elif all(g == "fail" for g in grades):
         pts, status = 0.0, "fail"
-        evid = f"training fit outside target for all measured variable(s): {statuses[:5]}"
+        evid = f"chunk size outside the universal band for all measured variable(s): {grades[:5]}"
+    else:
+        pts, status = 2.8, "partial"
+        evid = f"chunk size mixed/suboptimal across variables: {grades[:5]}"
     rem = None if status == "pass" else (
         "rechunk to 32-64 MB chunks/shards aligned with the sampling pattern "
         "(rechunker recipe in references/zarr.md)")
@@ -731,9 +755,16 @@ def score(asset: dict) -> dict:
     - ``inventory`` (list[dict]|None): Task 9's (possibly ranked/
       matched) variable inventory; falls back to ``open.inventory``.
     - ``chunking`` (dict): Task 7's ``assess_chunking()`` return,
-      ``{"variables": [{"shape", "chunks", "profiles": {"interactive"|
-      "training"|"agentic": {"status": "within"|"below"|"above"|
-      "unknown"}}, ...}]}``.
+      ``{"variables": [{"shape", "chunks", "grade": "pass"|"warn"|
+      "fail"|"unknown", "profiles": {"interactive"|"training"|
+      "agentic": {"status": "within"|"below"|"above"|"unknown"}},
+      ...}]}``. C1-interactive/C2-training (fix round, final-review
+      finding 1) score against ``grade`` -- the single, non-overlapping
+      chunk-size criterion the plan mandates -- not the three-profile
+      overlay's ``"within"`` membership (whose interactive/training
+      bands are mutually exclusive, so no single chunk size could ever
+      satisfy both). The profile overlay remains informational and
+      still feeds C3-agentic.
     - ``compression`` (dict): Task 8's ``assess_compression()`` return,
       ``{"inspection": [{"name", "codec", "status", "remediation"}],
       ...}``.
