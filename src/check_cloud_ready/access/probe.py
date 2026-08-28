@@ -77,9 +77,23 @@ def classify_access_failure(stage: str, status_or_exc) -> str:
 
 def _combine_classifications(head_classification, range_classification):
     """Combine a HEAD-stage and range-GET-stage classification into one
-    overall verdict. Auth wins outright (found at either stage); the
-    ranged GET is otherwise authoritative (it is the real test).
+    overall verdict. The ranged GET is authoritative (it is the real
+    test): a genuinely successful ranged GET (``"ok"`` -- e.g. a real
+    206 partial-content response proving anonymous range-read access
+    works) wins outright, even over a HEAD-stage ``"auth-required"``
+    signal -- some servers reject HEAD outright while serving anonymous
+    ranged GETs fine (a documented CDN/object-storage fronting pattern),
+    and that data is genuinely anonymously readable. Only when the
+    ranged GET itself did NOT succeed does a HEAD-stage or range-stage
+    ``"auth-required"`` register (found at either stage).
+
+    (S5 fix: the pre-fix version let a HEAD-stage "auth-required"
+    unconditionally override a successful ranged GET, contradicting its
+    own "ranged GET is authoritative" rationale -- see final-review
+    finding 5.)
     """
+    if range_classification == "ok":
+        return "ok"
     if "auth-required" in (head_classification, range_classification):
         return "auth-required"
     return range_classification
@@ -96,6 +110,13 @@ def probe_https(url, timeout=10, session=None):
     happens. When ``session`` is omitted, ``requests`` is soft-imported;
     if it isn't installed, returns a ``{"skipped": ...}`` dict instead
     of raising.
+
+    ``out["etag"]`` (additive, final-review finding 3): the response
+    ``ETag`` header, when the server sends one, so a strong ETag can
+    feed scoring.py's E1-version/E2-checksums checks. Captured from
+    whichever stage actually returned a response -- the ranged GET's
+    header (the authoritative stage) wins if both are present; ``None``
+    if neither stage sent one (or both stages failed).
     """
     if session is None:
         try:
@@ -109,13 +130,15 @@ def probe_https(url, timeout=10, session=None):
     else:
         sess = session
 
-    out = {"scheme": "https", "url": url}
+    out = {"scheme": "https", "url": url, "etag": None}
 
     try:
         r = sess.head(url, timeout=timeout, allow_redirects=False)
         out["head_status"] = r.status_code
         out["accept_ranges_header"] = r.headers.get("Accept-Ranges")
         out["content_length"] = r.headers.get("Content-Length")
+        if r.headers.get("ETag"):
+            out["etag"] = r.headers.get("ETag")
         loc = r.headers.get("Location")
         if loc:
             out["redirect_location"] = loc
@@ -147,6 +170,9 @@ def probe_https(url, timeout=10, session=None):
             range_classification = "auth-required"
         else:
             range_classification = classify_access_failure("range-get", r.status_code)
+
+        if r.headers.get("ETag"):
+            out["etag"] = r.headers.get("ETag")
 
         if range_classification == "ok":
             out["range_requests"] = "supported"
@@ -243,6 +269,7 @@ def probe_s3(url, timeout=10, signed=False):
             res["head_object"] = "ok"
             res["head_classification"] = "ok"
             res["content_length"] = h.get("ContentLength")
+            res["etag"] = h.get("ETag")  # final-review finding 3
         except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             res["head_object_error"] = code
@@ -288,6 +315,9 @@ def probe_s3(url, timeout=10, signed=False):
             out["signed"] = {"error": f"{type(e).__name__}: {e}"}
 
     out["classification"] = out["anonymous"].get("classification", "ok")
+    # final-review finding 3: surface whichever attempt actually got an
+    # ETag (anonymous first, since it's tried first and is preferred).
+    out["etag"] = out["anonymous"].get("etag") or (out.get("signed") or {}).get("etag")
     return out
 
 

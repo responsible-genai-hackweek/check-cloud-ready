@@ -132,6 +132,61 @@ class TestPublicS3(unittest.TestCase):
         self.assertEqual(prompter.calls, [])
 
 
+class TestEtagThreading(unittest.TestCase):
+    """Final-review finding 3: a live probe's captured ETag (when the
+    server sent one) must be threaded through onto AccessResult.etag so
+    the CLI orchestrator can populate scoring.py's asset["etag"] --
+    before this fix, nothing ever set it, so E1-version/E2-checksums
+    were permanently fail/partial for every non-Icechunk asset,
+    regardless of what the endpoint actually served.
+    """
+
+    @mock.patch.object(probe_module, "probe_https")
+    def test_public_https_with_etag_is_threaded_onto_access_result(self, mock_probe_https):
+        mock_probe_https.return_value = {
+            "scheme": "https", "url": "https://example.com/x.tif",
+            "classification": "ok", "range_classification": "ok",
+            "etag": '"abc123"',
+        }
+        prompter = FakePrompter()
+
+        result = workflow.resolve_access("https://example.com/x.tif", prompter=prompter)
+
+        self.assertEqual(result.etag, '"abc123"')
+
+    @mock.patch.object(probe_module, "probe_https")
+    def test_public_https_without_etag_leaves_it_none(self, mock_probe_https):
+        mock_probe_https.return_value = {
+            "scheme": "https", "url": "https://example.com/x.tif",
+            "classification": "ok", "range_classification": "ok",
+            "etag": None,
+        }
+        prompter = FakePrompter()
+
+        result = workflow.resolve_access("https://example.com/x.tif", prompter=prompter)
+
+        self.assertIsNone(result.etag)
+
+    @mock.patch.object(nasa_s3_module, "get_fs")
+    @mock.patch.object(probe_module, "probe_s3")
+    def test_public_s3_with_etag_is_threaded_onto_access_result(
+            self, mock_probe_s3, mock_get_fs):
+        mock_probe_s3.return_value = {
+            "scheme": "s3", "url": "s3://bucket/key", "classification": "ok",
+            "etag": '"def456"',
+        }
+        mock_get_fs.return_value = ("FAKE_FS", "s3://bucket/key")
+        prompter = FakePrompter()
+
+        result = workflow.resolve_access("s3://bucket/key", prompter=prompter)
+
+        self.assertEqual(result.etag, '"def456"')
+
+    def test_local_path_has_no_etag(self):
+        result = workflow.resolve_access("/data/local/file.nc", prompter=FakePrompter())
+        self.assertIsNone(result.etag)
+
+
 class TestGranuleIdInput(unittest.TestCase):
     @mock.patch.object(nasa_s3_module, "get_fs")
     @mock.patch.object(resolve_granule_module, "resolve")

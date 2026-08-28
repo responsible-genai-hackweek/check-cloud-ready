@@ -93,6 +93,14 @@ class AccessResult:
     # (License/DOI/ContactPersons/RelatedUrls/ScienceKeywords/Abstract)
     # -- this module only carries the raw document through.
     cmr_umm: Any = None
+    # Additive (final-review finding 3): the HTTP/S3 ETag captured by
+    # ``access.probe``'s live HEAD/HeadObject (or ranged GET/GetObject)
+    # probe, when the endpoint sent one -- None when no probe ran (local/
+    # no-network/error paths), the probe didn't get one, or the probe was
+    # skipped (soft-import unavailable). The CLI orchestrator threads
+    # this straight into scoring.py's `asset["etag"]` for E1-version/
+    # E2-checksums; this module never fabricates one.
+    etag: Any = None
 
 
 # fs=None is only valid for these auth values (see AccessResult docstring,
@@ -101,11 +109,11 @@ class AccessResult:
 _FS_NONE_ALLOWED_AUTH = {"local", "no-network", "error"}
 
 
-def _make_result(fs, path, url, findings, auth, notes, cmr_umm=None):
+def _make_result(fs, path, url, findings, auth, notes, cmr_umm=None, etag=None):
     if fs is None and auth not in _FS_NONE_ALLOWED_AUTH:
         auth = "error"
     return AccessResult(fs=fs, path=path, url=url, findings=findings,
-                         auth=auth, notes=notes, cmr_umm=cmr_umm)
+                         auth=auth, notes=notes, cmr_umm=cmr_umm, etag=etag)
 
 
 # --------------------------------------------------------------- findings
@@ -294,6 +302,7 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
                  earthaccess_fallback, findings, notes):
     probe_result = probe.probe_s3(url)
     findings.append(_range_finding(probe_result))
+    etag = probe_result.get("etag")
 
     public = probe_result.get("classification") == "ok"
 
@@ -312,7 +321,7 @@ def _resolve_s3(url, *, prompter, anon, credentials_url, granule_id,
             status = "warn"
         findings.append(_finding("D2-auth", "D", status, evidence))
         return _make_result(fs=fs, path=path, url=url, findings=findings,
-                             auth="anonymous", notes=notes)
+                             auth="anonymous", notes=notes, etag=etag)
 
     notes.append("Anonymous S3 access failed or requires authentication.")
 
@@ -469,9 +478,10 @@ def _maybe_earthaccess_fallback(url, prompter, earthaccess_fallback, findings, n
 def _resolve_https(url, *, findings, notes, cmr_umm=None):
     probe_result = probe.probe_https(url)
     findings.append(_range_finding(probe_result))
+    etag = probe_result.get("etag")
 
     if probe_result.get("classification") != "auth-required":
-        return _plain_https_fs(url, findings, notes, cmr_umm=cmr_umm)
+        return _plain_https_fs(url, findings, notes, cmr_umm=cmr_umm, etag=etag)
 
     notes.append("HTTPS endpoint requires Earthdata Login (401/403 or URS redirect detected).")
 
@@ -488,7 +498,7 @@ def _resolve_https(url, *, findings, notes, cmr_umm=None):
                         "urs.earthdata.nasa.gov, then retry."),
         ))
         return _make_result(fs=None, path=url, url=url, findings=findings,
-                             auth="error", notes=notes, cmr_umm=cmr_umm)
+                             auth="error", notes=notes, cmr_umm=cmr_umm, etag=etag)
 
     fs, build_error = _build_fsspec_https(headers={"Authorization": f"Bearer {token}"})
     if fs is None:
@@ -504,10 +514,10 @@ def _resolve_https(url, *, findings, notes, cmr_umm=None):
             "HTTPS access authenticated via an Earthdata Login bearer token.",
         ))
     return _make_result(fs=fs, path=url, url=url, findings=findings,
-                         auth="edl-bearer", notes=notes, cmr_umm=cmr_umm)
+                         auth="edl-bearer", notes=notes, cmr_umm=cmr_umm, etag=etag)
 
 
-def _plain_https_fs(url, findings, notes, cmr_umm=None):
+def _plain_https_fs(url, findings, notes, cmr_umm=None, etag=None):
     fs, build_error = _build_fsspec_https(headers=None)
     if fs is None:
         findings.append(_finding(
@@ -516,7 +526,7 @@ def _plain_https_fs(url, findings, notes, cmr_umm=None):
             remediation=_fs_build_remediation(build_error),
         ))
     return _make_result(fs=fs, path=url, url=url, findings=findings,
-                         auth="anonymous", notes=notes, cmr_umm=cmr_umm)
+                         auth="anonymous", notes=notes, cmr_umm=cmr_umm, etag=etag)
 
 
 def _build_fsspec_https(headers):

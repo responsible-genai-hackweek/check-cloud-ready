@@ -169,6 +169,84 @@ class TestProbeHttps(unittest.TestCase):
         self.assertIn("skipped", result)
         self.assertEqual(result["scheme"], "https")
 
+    def test_head_auth_required_but_range_get_succeeds_wins_as_ok(self):
+        """S5 fix (final-review finding 5): some servers reject HEAD
+        outright but serve anonymous ranged GETs fine (a documented CDN/
+        object-storage fronting pattern). The combined classification
+        must follow the successful ranged GET (a real 206), not the
+        HEAD-stage auth-required signal -- the pre-fix code let HEAD's
+        auth-required unconditionally override a successful ranged GET,
+        which incorrectly reported data that is genuinely anonymously
+        readable as requiring auth (and, via cli.py, could trigger a
+        hard exit 2 with no EDL token available)."""
+        head = FakeResponse(403)
+        get = FakeResponse(206, headers={"Content-Range": "bytes 0-1023/1000"},
+                            body=b"\x89HDF\r\n\x1a\n")
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertEqual(result["head_classification"], "auth-required")
+        self.assertEqual(result["range_classification"], "ok")
+        self.assertEqual(result["classification"], "ok")
+
+    def test_head_auth_required_and_range_get_also_fails_stays_auth_required(self):
+        """Companion/no-regression case: when the ranged GET does NOT
+        succeed, a HEAD-stage auth-required signal must still register."""
+        head = FakeResponse(403)
+        get = FakeResponse(403)
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertEqual(result["classification"], "auth-required")
+
+    def test_head_ok_but_range_get_auth_required_stays_auth_required(self):
+        """Companion/no-regression case: a successful HEAD must not mask
+        an auth-required ranged GET (the real, authoritative test)."""
+        head = FakeResponse(200)
+        get = FakeResponse(403)
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertEqual(result["head_classification"], "ok")
+        self.assertEqual(result["range_classification"], "auth-required")
+        self.assertEqual(result["classification"], "auth-required")
+
+
+class TestProbeHttpsEtag(unittest.TestCase):
+    """Final-review finding 3: probe_https must capture a response ETag
+    (when the server sends one) so it can be threaded through to
+    scoring.py's E1-version/E2-checksums checks."""
+
+    def test_etag_captured_from_head(self):
+        head = FakeResponse(200, headers={"ETag": '"abc123"'})
+        get = FakeResponse(206, headers={"Content-Range": "bytes 0-1023/1000"})
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertEqual(result["etag"], '"abc123"')
+
+    def test_etag_falls_back_to_range_get_response_when_head_lacks_it(self):
+        head = FakeResponse(200)  # no ETag header at all
+        get = FakeResponse(206, headers={"ETag": '"xyz789"'})
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertEqual(result["etag"], '"xyz789"')
+
+    def test_etag_is_none_when_absent_from_both_stages(self):
+        head = FakeResponse(200)
+        get = FakeResponse(206)
+        session = FakeSession(head, get)
+
+        result = probe_https("https://example.com/data.h5", session=session)
+
+        self.assertIsNone(result["etag"])
+
 
 class TestProbeS3SkippedWithoutBoto3(unittest.TestCase):
     def test_boto3_missing_reports_skipped(self):
