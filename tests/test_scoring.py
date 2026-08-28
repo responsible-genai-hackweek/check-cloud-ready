@@ -227,8 +227,10 @@ class TierBoundaryTests(unittest.TestCase):
 
 
 class FailRemediationTests(unittest.TestCase):
-    """Scenario 8: every fail carries a remediation; a fail constructed
-    without one gets filled in from the fallback/migration table."""
+    """Scenario 8: every fail/partial check carries a remediation; a
+    fail/partial constructed without one gets filled in from the
+    fallback/migration table (rubric.md section 8: "every fail/partial
+    check must carry at least one remediation")."""
 
     def test_fail_without_remediation_gets_filled(self):
         asset = _golden_zarr_asset()
@@ -254,6 +256,50 @@ class FailRemediationTests(unittest.TestCase):
         self.assertTrue(fails)
         for c in fails:
             self.assertTrue(c["remediation"], msg=c)
+
+    def test_partial_warn_from_access_findings_without_remediation_gets_filled(self):
+        """Fix round (review finding 1): reproduces the real
+        access/workflow.py D2-auth path where ``anon=True`` forces
+        anonymous S3 access despite a protected-bucket probe result
+        (workflow.py ~l.300-305) -- that finding ships with
+        ``status="warn"`` (-> this module's ``"partial"``) and
+        ``remediation=None``. The backstop must fill it in, not just for
+        outright fails.
+        """
+        asset = _golden_zarr_asset()
+        asset["access_findings"] = [
+            _access_finding("D2-auth", "D", "warn",
+                            "anonymous access forced despite a protected-bucket "
+                            "probe result", remediation=None),
+        ]
+        result = score(asset)
+        d2 = next(c for c in result["checks"] if c["id"] == "D2-auth")
+        self.assertEqual(d2["status"], "partial")
+        self.assertTrue(d2["remediation"])
+
+    def test_every_fail_or_partial_has_remediation(self):
+        """Broader property check across several scenarios already used
+        elsewhere in this file: no fail or partial check should ever
+        ship with an empty remediation."""
+        assets = [_golden_zarr_asset()]
+
+        a = _golden_zarr_asset()
+        a["access_findings"] = [
+            _access_finding("D3-https-cors", "D", "warn", "CORS header missing",
+                            remediation=None),
+        ]
+        assets.append(a)
+
+        b = _golden_zarr_asset()
+        b["format"] = "hdf4"
+        b["chunking"] = {"variables": [_variable("/temp", "above")]}
+        assets.append(b)
+
+        for asset in assets:
+            result = score(asset)
+            for c in result["checks"]:
+                if c["status"] in ("fail", "partial"):
+                    self.assertTrue(c["remediation"], msg=c)
 
 
 class CloudHostileFormatTests(unittest.TestCase):

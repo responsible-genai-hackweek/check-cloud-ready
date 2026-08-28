@@ -18,8 +18,8 @@ Ported from (read, not imported):
 - ``.claude/skills/earth-science-cloud-readiness/references/rubric.md``:
   dimension weights (A30/B20/C25/D15/E10), sub-check points, tiers
   (90/75/55/35), and the hard rules (smoke FAIL caps the score at 74;
-  SKIPPED downgrades confidence, never the score; every fail needs a
-  remediation).
+  SKIPPED downgrades confidence, never the score; every fail/partial
+  needs a remediation).
 - ``.claude/skills/check-cloud-ready/SKILL.md`` (~l.226-230): the
   categorical verdict mapping (READY / READY WITH CAVEATS / NOT READY).
 
@@ -56,6 +56,22 @@ reworked as follows, per the task brief:
   ported code's literal behavior (which always failed E3 outright with
   no license, catalog or not); the brief's test list requires
   ``cmr_meta is None -> E3/E4 skipped``.
+
+Known gaps
+----------
+- **A-class HDF5/NetCDF4 paged-aggregation sub-check (up to +5 in the
+  ported rubric) is not evaluated.** assess.py's ``score_asset()`` reads
+  ``file_space``/``page_size``-shaped telemetry (2-16 MB page band,
+  NASA ESDIS/IMPACT guidance -- rubric.md section 9) that ``openers.py``'s
+  HDF5 inventory records simply don't capture (its per-dataset records
+  are name/dims/shape/dtype/chunks/attrs/size_bytes/codec only -- see
+  ``_a_class_check``'s hdf5/netcdf4 branch for the inline note). This is
+  an upstream data gap in Task 6, not something this module can correctly
+  fill in with a proxy signal, so it is silently absent rather than wired
+  to fabricated evidence: today, an HDF5/NetCDF4 asset's A-class ceiling
+  is its class baseline plus the chunking/contiguity adjustments this
+  module does compute, never the full paged-aggregation bonus the
+  original rubric allowed for.
 
 Wiring contract (asset dict)
 -----------------------------
@@ -105,8 +121,8 @@ _MIGRATIONS = {
 }
 _MIGRATIONS["tar"] = _MIGRATIONS["gzip"] = _MIGRATIONS["zip"]
 
-_GENERIC_FAIL_REMEDIATION = ("remediation not captured for this failing check; "
-                             "investigate the underlying finding")
+_GENERIC_REMEDIATION = ("remediation not captured for this fail/partial check; "
+                        "investigate the underlying finding")
 _D_FALLBACK_REMEDIATION = {
     "D1-range": "enable/verify HTTP Range support (206 responses) on the data endpoint",
     "D2-auth": "document auth clearly; verify credentials / requester-pays configuration",
@@ -118,7 +134,11 @@ _D_FALLBACK_REMEDIATION = {
 # Checks whose FAIL a real consumer would actually hit (SKILL.md ~l.226-230):
 # smoke fail (handled separately, via smoke_status), chunk-size fail
 # (C1/C2), no range support (D1), a data-integrity flag (folded into
-# smoke_status -- see module docstring / task report for why).
+# smoke_status -- see module docstring / task report for why). This exact
+# 3-id set is this module's own judgment call reading SKILL.md's prose,
+# not a literal list from any source file -- D2/D3/D4 and every other
+# check are deliberately excluded (governance/reproducibility/transport
+# quality gaps a consumer wouldn't be blocked by, vs. actually hitting).
 _CONSUMER_VISIBLE_FAIL_IDS = {"C1-interactive", "C2-training", "D1-range"}
 
 
@@ -243,6 +263,19 @@ def _a_class_check(asset, fmt):
             evid.append("virtual Zarr over archival files: access fixed, "
                         "underlying chunk layout frozen")
     elif fmt in ("hdf5", "netcdf4"):
+        # NOTE (Task 10 fix round, review finding 2): the ported assess.py
+        # awarded up to +5 here for "paged aggregation" (file_space/
+        # page_size in the 2-16 MB band, per NASA ESDIS/IMPACT guidance --
+        # rubric.md section 9). That sub-check is NOT ported: openers.py's
+        # HDF5 inventory records (Ruling I-1: name/dims/shape/dtype/chunks/
+        # attrs/size_bytes/codec) don't capture file_space/page_size at
+        # all -- the underlying data genuinely isn't available from Task 6
+        # today, so there is nothing correct to score here rather than a
+        # missing wiring detail to fix in this module. A-class's HDF5/
+        # NetCDF4 baseline is therefore scored on chunking/contiguity
+        # adjustments only; its ceiling is baseline + those adjustments,
+        # never the full +5 the ported rubric allowed for paged
+        # aggregation. Revisit once openers.py surfaces file_space info.
         dsets = inv
         chunked = [d for d in dsets if d.get("chunks")]
         contiguous = [d.get("name") for d in dsets
@@ -639,26 +672,35 @@ def _e_catalog_checks(cmr_meta):
     return [e3, e4, e5, e6, e7]
 
 
-# --------------------------------------------------------------- fail-remediation
+# ------------------------------------------------------------- remediation
 
-def _ensure_fail_remediation(checks, fmt):
+def _ensure_remediation(checks, fmt):
     """Rubric.md section 8: every fail/partial check must carry a
     remediation ("with an exact command where one exists"). This module
     constructs every check itself and normally always sets one for a
-    fail (see each builder above), EXCEPT D-checks, which pass through
-    an externally-supplied ``remediation`` from ``access_findings`` --
-    if that caller left it empty, fill it in here (per-id fallback text,
-    or the ported cloud-hostile migration dict for A-class) rather than
-    letting a fail with no fix ship.
+    fail or partial (see each builder above), EXCEPT D-checks, which pass
+    through an externally-supplied ``remediation`` from
+    ``access_findings`` -- if that caller left it empty, fill it in here
+    (per-id fallback text, or the ported cloud-hostile migration dict for
+    A-class) rather than letting a fail/partial with no fix ship.
+
+    Task 10 fix round (review finding 1): this originally only covered
+    ``status == "fail"``. That missed a real, reachable path:
+    ``access/workflow.py`` findings normalize to ``status="warn"`` (this
+    module's ``"partial"``) with no remediation attached in several
+    places -- e.g. the ``D2-auth`` finding built when ``anon=True``
+    forces anonymous S3 access despite a protected-bucket probe result
+    (``workflow.py`` ~l.300-305) -- and rubric.md is explicit that
+    "partial" needs a remediation too, not just "fail".
     """
     for c in checks:
-        if c["status"] == "fail" and not c["remediation"]:
+        if c["status"] in ("fail", "partial") and not c["remediation"]:
             if c["id"] == "A-class" and fmt in _MIGRATIONS:
                 c["remediation"] = _MIGRATIONS[fmt]
             elif c["id"] in _D_FALLBACK_REMEDIATION:
                 c["remediation"] = _D_FALLBACK_REMEDIATION[c["id"]]
             else:
-                c["remediation"] = _GENERIC_FAIL_REMEDIATION
+                c["remediation"] = _GENERIC_REMEDIATION
     return checks
 
 
@@ -740,7 +782,7 @@ def score(asset: dict) -> dict:
     checks.append(e2)
     checks.extend(_e_catalog_checks(asset.get("cmr_meta")))
 
-    _ensure_fail_remediation(checks, fmt)
+    _ensure_remediation(checks, fmt)
 
     dims, raw_score = rollup_checks(checks)
 
