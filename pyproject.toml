@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "check-cloud-ready"
+version = "0.1.0"
+description = "Assess whether an earth science dataset is cloud ready"
+requires-python = ">=3.12"
+dependencies = [
+    "fsspec",
+    "requests",
+    "aiohttp",
+    "obstore>=0.9,<1.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+s3 = ["s3fs", "boto3"]
+hdf5 = ["h5py"]
+zarr = ["zarr>=3", "numcodecs"]
+raster = ["rasterio", "rio-cogeo"]
+parquet = ["pyarrow"]
+nasa = ["earthaccess"]
+llm = ["anthropic"]
+cf = ["xarray"]
+all = [
+    "s3fs",
+    "boto3",
+    "h5py",
+    "zarr>=3",
+    "numcodecs",
+    "rasterio",
+    "rio-cogeo",
+    "pyarrow",
+    "earthaccess",
+    "anthropic",
+    "xarray",
+]
+dev = ["pytest", "h5py", "zarr>=3", "numcodecs", "pyarrow"]
+
+[project.scripts]
+check-cloud-ready = "check_cloud_ready.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/check_cloud_ready"]
+
+# rendering.py loads this via importlib.resources at runtime; force-included
+# so it ships in the wheel even if default (VCS-based) file selection ever
+# changes -- explicit rather than relying on hatchling's default behavior.
+[tool.hatch.build.targets.wheel.force-include]
+"src/check_cloud_ready/assets/report-template.md" = "check_cloud_ready/assets/report-template.md"
