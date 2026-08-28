@@ -372,8 +372,10 @@ def _zarr_store_for(fs, path: str):
     protos = proto if isinstance(proto, (list, tuple)) else (proto,)
     if "file" in protos or "local" in protos:
         return path
-    try:
-        return zarr.storage.FsspecStore(fs, path=path, read_only=True)
+    try: 
+        from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
+        async_fs = AsyncFileSystemWrapper(fs)
+        return zarr.storage.FsspecStore(async_fs, path=path, read_only=True)
     except TypeError:
         return None
 

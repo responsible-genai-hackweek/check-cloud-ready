@@ -438,7 +438,7 @@ def _run(args, prompter) -> int:
     style = args.report_style or prompter.choose(
         "Report style:", ["verdict", "score", "both"], default="both", flag="--report-style")
 
-    out_dir = Path(args.out) if args.out else Path(f"cloud-readiness-{_out_dirname(raw_input)}")
+    out_dir = Path(args.out) if args.out else Path(f"assessments/cloud-readiness-{_out_dirname(raw_input)}")
     report_path = rendering.write_report(findings, out_dir, style)
     (out_dir / "findings.json").write_text(
         json.dumps(findings, indent=2, sort_keys=True, default=str))

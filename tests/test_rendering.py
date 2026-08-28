@@ -292,7 +292,7 @@ class WriteReportTests(unittest.TestCase):
     def test_write_report_writes_file_and_returns_path(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            out_dir = Path(tmp) / "cloud-readiness-out"
+            out_dir = Path(tmp) / "assessments" / "cloud-readiness-out"
             path = rendering.write_report(FINDINGS, out_dir, "both")
             self.assertEqual(path, out_dir / "assessment-report.md")
             self.assertTrue(path.exists())

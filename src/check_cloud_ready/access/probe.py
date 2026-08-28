@@ -250,6 +250,7 @@ def probe_s3(url, timeout=10, signed=False):
 
     bucket_region = None
     probe_client = boto3.client("s3", config=anon_cfg)
+
     try:
         probe_client.head_bucket(Bucket=bucket)
         bucket_region = probe_client.meta.region_name
@@ -269,6 +270,7 @@ def probe_s3(url, timeout=10, signed=False):
             res["head_object"] = "ok"
             res["head_classification"] = "ok"
             res["content_length"] = h.get("ContentLength")
+            is_directory = h.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("content-type") == "application/x-directory"
             res["etag"] = h.get("ETag")  # final-review finding 3
         except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code")
@@ -280,12 +282,13 @@ def probe_s3(url, timeout=10, signed=False):
 
         try:
             t0 = time.monotonic()
-            g = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-1023")
-            body = g["Body"].read()
-            res["range_get"] = "ok (S3 always supports ranges)"
+            if not is_directory:
+                g = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-1023")
+                body = g["Body"].read()
+                res["range_get"] = "ok (S3 always supports ranges)"
+                res["range_ttfb_s"] = round(time.monotonic() - t0, 3)
+                res["first_bytes_hex"] = body[:16].hex()
             res["range_classification"] = "ok"
-            res["range_ttfb_s"] = round(time.monotonic() - t0, 3)
-            res["first_bytes_hex"] = body[:16].hex()
         except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             res["range_get_error"] = code
