@@ -234,6 +234,57 @@ class ZarrE2ETests(_TmpDirCase):
         findings = json.loads((Path(out_dir) / "findings.json").read_text())
         self.assertEqual(len(findings["assets"][0]["inventory"]), 1)
 
+    def test_local_zarr_input_gets_a_real_measured_chunk_size(self):
+        """Finding-2 fix: a local-path input's access_result.fs is None
+        (access.workflow's local branch never builds a filesystem) --
+        that None used to be passed straight into
+        chunking.assess_chunking, whose zarr sampler then failed
+        internally (fs.find on None) and silently degraded to the
+        2:1-ratio *estimate*, with the raw AttributeError string landing
+        in findings.json's coordinate_chunking_notes. A local zarr store
+        run through the real CLI path must get a genuinely measured
+        chunk size instead."""
+        store = _make_zarr_store(self.tmp)
+        out_dir = os.path.join(self.tmp, "out")
+
+        rc = cli.main([store, "--non-interactive", "--out", out_dir])
+
+        self.assertEqual(rc, 0)
+        raw = (Path(out_dir) / "findings.json").read_text()
+        findings = json.loads(raw)
+        variables = findings["assets"][0]["chunking"]["variables"]
+        self.assertTrue(variables)
+        for v in variables:
+            self.assertTrue(v["measured"], msg=v)
+        self.assertNotIn("AttributeError", raw)
+        self.assertNotIn("NoneType", raw)
+
+    def test_cf_checks_see_the_full_inventory_not_just_the_selection(self):
+        """Finding-4 fix: CF conformance is a file-level property. The
+        store fixture has a real CF time coordinate variable ("/time")
+        that only shows up in the FULL inventory, not in a
+        single-variable selection of "temperature". Before the fix,
+        conventions.check_cf was called with only the selected
+        variable(s), so coordinate_identification came back ok=None
+        ("not evaluated") even though a real, resolvable time coordinate
+        exists in the file. After the fix it must see the full
+        inventory and correctly report ok=True."""
+        store = _make_zarr_store(self.tmp)
+        out_dir = os.path.join(self.tmp, "out")
+
+        rc = cli.main([store, "--non-interactive", "--variables", "temperature",
+                       "--out", out_dir])
+
+        self.assertEqual(rc, 0)
+        findings = json.loads((Path(out_dir) / "findings.json").read_text())
+        asset = findings["assets"][0]
+        self.assertEqual([v["name"] for v in asset["inventory"]], ["/temperature"])
+
+        checks = {c["id"]: c for c in asset["conventions"]["cf"]["checks"]}
+        self.assertIsNotNone(checks["coordinate_identification"]["ok"])
+        self.assertTrue(checks["coordinate_identification"]["ok"],
+                        msg=checks["coordinate_identification"])
+
 
 @unittest.skipUnless(h5py, "h5py not installed")
 class Hdf5E2ETests(_TmpDirCase):
@@ -253,6 +304,53 @@ class Hdf5E2ETests(_TmpDirCase):
         report = (Path(out_dir) / "assessment-report.md").read_text()
         self.assertTrue(report.startswith("**Verdict:"))
         self.assertIn("Chunk layout", report)
+
+
+@unittest.skipUnless(zarr, "zarr not installed")
+class EtagThreadingTests(_TmpDirCase):
+    """Final-review finding 3: a live probe's captured ETag must reach
+    asset["etag"] in findings.json (nothing in cli.py used to set it at
+    all, so E1-version/E2-checksums were permanently fail/partial
+    regardless of what the endpoint actually served). Faithfully
+    exercises the real cli.py wiring (asset["etag"] = access_result.etag)
+    offline by monkeypatching access.workflow.resolve_access to return a
+    canned AccessResult with a strong ETag set -- the same pattern
+    FatalAccessErrorTests below uses to exercise auth="error" without
+    live network access, since access.workflow.resolve_access is the
+    sole producer of AccessResult.
+    """
+
+    def test_strong_etag_from_access_result_reaches_asset_and_unblocks_e1_e2(self):
+        from check_cloud_ready.access.workflow import AccessResult
+
+        store = _make_zarr_store(self.tmp)
+        out_dir = os.path.join(self.tmp, "out")
+        canned = AccessResult(
+            fs=None, path=store, url=store, findings=[], auth="anonymous",
+            notes=[], etag='"strong-etag-abc123"')
+
+        with mock.patch("check_cloud_ready.access.workflow.resolve_access",
+                        return_value=canned):
+            rc = cli.main([store, "--non-interactive", "--out", out_dir])
+
+        self.assertEqual(rc, 0)
+        findings = json.loads((Path(out_dir) / "findings.json").read_text())
+        asset = findings["assets"][0]
+        self.assertEqual(asset["etag"], '"strong-etag-abc123"')
+
+        checks = {c["id"]: c for c in asset["checks"]}
+        self.assertNotEqual(checks["E1-version"]["status"], "fail")
+        self.assertNotEqual(checks["E2-checksums"]["status"], "fail")
+
+    def test_no_etag_from_access_result_leaves_asset_etag_none(self):
+        store = _make_zarr_store(self.tmp)
+        out_dir = os.path.join(self.tmp, "out")
+
+        rc = cli.main([store, "--non-interactive", "--out", out_dir])
+
+        self.assertEqual(rc, 0)
+        findings = json.loads((Path(out_dir) / "findings.json").read_text())
+        self.assertIsNone(findings["assets"][0]["etag"])
 
 
 class FatalAccessErrorTests(_TmpDirCase):

@@ -294,14 +294,36 @@ def _run(args, prompter) -> int:
     conv = {"cf": None}
 
     if selected:
-        conv = {"cf": conventions.check_cf(selected, _global_attrs(handle, fmt))}
+        # Finding-4 fix: CF conformance is a FILE-level property --
+        # coordinate identification, grid-mapping resolution, and bounds
+        # checks need to cross-reference the coordinate/grid-mapping/
+        # bounds variables against the WHOLE file inventory, not just
+        # whichever 1 variable a user happened to select for chunking/
+        # compression assessment. Passing `selected` here silently
+        # returned "not evaluated" (ok=None) for checks whose supporting
+        # variables exist in the file but weren't in the selection --
+        # a false-negative risk that could mask real broken CF metadata.
+        # chunking/compression correctly keep using `selected` below
+        # (those genuinely are per-selected-variable assessments).
+        conv = {"cf": conventions.check_cf(inv_list, _global_attrs(handle, fmt))}
 
         run_benchmark = False
         sample = None
         keepbits = None
         if handle is not None:
+            # S2/Finding-2 fix: access_result.fs is None for any local-path
+            # input (the local branch of access.workflow never builds a
+            # filesystem). Passing that raw None straight into
+            # chunking.assess_chunking made its zarr sampler fail
+            # internally (fs.find on None) and silently degrade to the
+            # 2:1-ratio *estimate* -- with the raw AttributeError string
+            # landing in findings.json -- instead of a real measurement.
+            # Reuse the same eff_fs/_local_fs() fallback the geozarr check
+            # below already relies on so local zarr/HDF5 inputs get a real
+            # measured chunk size.
+            eff_fs = access_result.fs if access_result.fs is not None else _local_fs()
             chunking_out = chunking.assess_chunking(
-                handle, access_result.fs, access_result.path, selected,
+                handle, eff_fs, access_result.path, selected,
                 budget=budget, use_case=args.use_case, engine=fmt)
 
             if args.benchmark is None:
@@ -317,7 +339,6 @@ def _run(args, prompter) -> int:
                     sample, args.bitround_max_abs_error)
 
             if fmt in ("zarr", "icechunk"):
-                eff_fs = access_result.fs if access_result.fs is not None else _local_fs()
                 conv["geozarr"] = conventions.check_geozarr(eff_fs, access_result.path)
 
         compression_out = compression.assess_compression(
@@ -360,6 +381,12 @@ def _run(args, prompter) -> int:
         "conventions": conv,
         "smoke_status": smoke_status,
         "cmr_meta": _cmr_meta_from(access_result),
+        # Finding-3 fix: thread the live-probe ETag (access.probe's HEAD/
+        # HeadObject or ranged-GET/GetObject response header, captured on
+        # AccessResult by access.workflow) through so scoring.py's
+        # E1-version/E2-checksums can credit a real strong ETag instead
+        # of permanently reading etag=None for every non-Icechunk asset.
+        "etag": access_result.etag,
         "profile": args.use_case,
         # S8: budget.breaches only ever contains stages that actually
         # breached (both check_stage("open"/"assessments", ...) calls
