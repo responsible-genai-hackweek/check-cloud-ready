@@ -135,8 +135,6 @@ def _reproduce_current_codec(current_codec: str | None, itemsize: int):
     outcome, not "exotic" -- distinct from an unrecognized non-empty
     string like "lzf".
     """
-    from numcodecs import Blosc, Shuffle, Zlib, Zstd
-
     if current_codec is None or str(current_codec).strip().lower() in _UNCOMPRESSED_STRINGS:
         return [], "uncompressed"
 
@@ -148,21 +146,21 @@ def _reproduce_current_codec(current_codec: str | None, itemsize: int):
     if m:
         cname = m.group(1)
         level = int(m.group(2)) if m.group(2) else (5 if cname == "lz4" else 3)
-        shuffle_mode = Blosc.SHUFFLE if want_shuffle else Blosc.NOSHUFFLE
-        return [Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)], s
+        shuffle_mode = numcodecs.Blosc.SHUFFLE if want_shuffle else numcodecs.Blosc.NOSHUFFLE
+        return [numcodecs.Blosc(cname=cname, clevel=level, shuffle=shuffle_mode)], s
 
     m = re.search(r"zstd(?:[-(](\d+)\)?)?", sl)
     if m and "blosc" not in sl:
         level = int(m.group(1)) if m.group(1) else 3
-        codecs = [Shuffle(itemsize)] if want_shuffle else []
-        codecs.append(Zstd(level=level))
+        codecs = [numcodecs.Shuffle(itemsize)] if want_shuffle else []
+        codecs.append(numcodecs.Zstd(level=level))
         return codecs, s
 
     m = re.search(r"gzip(?:[-(](\d+)\)?)?", sl)
     if m:
         level = int(m.group(1)) if m.group(1) else 4  # "level from file if known else 4"
-        codecs = [Shuffle(itemsize)] if want_shuffle else []
-        codecs.append(Zlib(level=level))
+        codecs = [numcodecs.Shuffle(itemsize)] if want_shuffle else []
+        codecs.append(numcodecs.Zlib(level=level))
         return codecs, s
 
     return None, s  # exotic: cannot reproduce locally
@@ -172,17 +170,15 @@ def _build_grid(itemsize: int):
     """Standard lossless grid: {zstd-1,3,5, blosc-lz4, blosc-zstd-3} x
     {shuffle, noshuffle}. Returns [(config_name, [codec, ...]), ...].
     """
-    from numcodecs import Blosc, Shuffle, Zstd
-
     grid = []
     for lvl in _ZSTD_LEVELS:
-        grid.append((f"zstd-{lvl}+shuffle", [Shuffle(itemsize), Zstd(level=lvl)]))
-        grid.append((f"zstd-{lvl}", [Zstd(level=lvl)]))
+        grid.append((f"zstd-{lvl}+shuffle", [numcodecs.Shuffle(itemsize), numcodecs.Zstd(level=lvl)]))
+        grid.append((f"zstd-{lvl}", [numcodecs.Zstd(level=lvl)]))
     for cname, lvl in _BLOSC_VARIANTS:
         grid.append((f"blosc-{cname}-{lvl}+shuffle",
-                     [Blosc(cname=cname, clevel=lvl, shuffle=Blosc.SHUFFLE)]))
+                     [numcodecs.Blosc(cname=cname, clevel=lvl, shuffle=numcodecs.Blosc.SHUFFLE)]))
         grid.append((f"blosc-{cname}-{lvl}",
-                     [Blosc(cname=cname, clevel=lvl, shuffle=Blosc.NOSHUFFLE)]))
+                     [numcodecs.Blosc(cname=cname, clevel=lvl, shuffle=numcodecs.Blosc.NOSHUFFLE)]))
     return grid
 
 
@@ -285,10 +281,7 @@ def benchmark(data: "np.ndarray", current_codec: str | None, *,
 
     # Optional lossy BitRound variants of the same grid.
     if keepbits is not None:
-        try:
-            from numcodecs import BitRound
-        except ImportError:
-            BitRound = None
+        BitRound = getattr(numcodecs, "BitRound", None)
         if BitRound is not None:
             for name, grid_codecs in grid:
                 lossy_codecs = [BitRound(keepbits=keepbits)] + grid_codecs
