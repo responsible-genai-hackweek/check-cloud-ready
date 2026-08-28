@@ -37,7 +37,7 @@ all = [
     "anthropic",
     "xarray",
 ]
-dev = ["pytest"]
+dev = ["pytest", "h5py", "zarr>=3", "numcodecs", "pyarrow"]
 
 [project.scripts]
 check-cloud-ready = "check_cloud_ready.cli:main"

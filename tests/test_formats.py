@@ -4,7 +4,9 @@ No network access. Byte fixtures are built in-test; store layouts are
 probed against a tiny dict-backed fake fs.
 """
 import json
+import sys
 import unittest
+from unittest import mock
 
 from check_cloud_ready import formats
 
@@ -193,9 +195,13 @@ class TestSniffStore(unittest.TestCase):
 
 class TestRefineHdf5(unittest.TestCase):
     def test_h5py_missing_returns_unrefined_with_note(self):
-        # h5py is not installed in this environment, so this exercises the
-        # soft-import fallback path.
-        out = refine_hdf5(None, None)
+        # h5py may or may not be installed in this environment (the
+        # openers.py dev extra pulls it in for tests/test_openers.py), so
+        # force the ImportError branch explicitly rather than relying on
+        # ambient absence: assigning None in sys.modules makes `import
+        # h5py` raise ImportError regardless of what's actually installed.
+        with mock.patch.dict(sys.modules, {"h5py": None}):
+            out = refine_hdf5(None, None)
         self.assertEqual(out.get("refinement"), "skipped: h5py not installed")
         self.assertIn("format", out)
 
