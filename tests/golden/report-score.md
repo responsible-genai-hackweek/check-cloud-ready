@@ -21,6 +21,10 @@ Tier C · 71.5/100 · confidence Reduced
 
 - **`sea_water_temperature`** (map-optimized): This layout stores one full spatial map per chunk and slices time thinly: a full-extent map read at one time step touches a single chunk (cheap), but a full time series at one point touches all 365 chunks (expensive). Good fit for map-at-a-time workflows; poor fit for point-timeseries extraction.
 
+## Budget / stage breaches
+
+No budget breaches — every stage completed within its byte/time cap.
+
 ## Per-asset findings
 
 ### `s3://demo-bucket/ocean-temp.zarr` — zarr — 71.5/100 (C)

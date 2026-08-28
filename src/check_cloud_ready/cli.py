@@ -361,6 +361,13 @@ def _run(args, prompter) -> int:
         "smoke_status": smoke_status,
         "cmr_meta": _cmr_meta_from(access_result),
         "profile": args.use_case,
+        # S8: budget.breaches only ever contains stages that actually
+        # breached (both check_stage("open"/"assessments", ...) calls
+        # above ran with raise_on_breach=False so a breach never crashes
+        # the run) -- read once here so the fact surfaces in
+        # findings.json and the rendered report (rendering.py's
+        # budget_breaches_section) instead of being silently absorbed.
+        "budget_breaches": list(budget.breaches),
     }
     scored = scoring.score(asset)
     asset["checks"] = scored["checks"]

@@ -21,6 +21,10 @@
 
 - **`sea_water_temperature`** (map-optimized): This layout stores one full spatial map per chunk and slices time thinly: a full-extent map read at one time step touches a single chunk (cheap), but a full time series at one point touches all 365 chunks (expensive). Good fit for map-at-a-time workflows; poor fit for point-timeseries extraction.
 
+## Budget / stage breaches
+
+No budget breaches — every stage completed within its byte/time cap.
+
 ## Prioritized remediation
 
 1. **[C1-interactive, 10 pts at stake]** rewrite with ~2 MB chunks/tiles aligned to viewport access (e.g. 1x180x360), or publish a lower-resolution overview variable for interactive use

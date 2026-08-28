@@ -269,6 +269,23 @@ class RobustnessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rendering.render(FINDINGS, "html")
 
+    def test_no_budget_breaches_renders_reassuring_placeholder(self):
+        for style in ("verdict", "score", "both"):
+            doc = rendering.render(FINDINGS, style)
+            self.assertIn("No budget breaches", doc, f"style={style!r}")
+
+    def test_budget_breach_is_visible_in_every_style(self):
+        findings = self._findings_with_none(budget_breaches=[
+            {"stage": "open", "elapsed_s": 12.3, "cap_s": 5.0, "breached": True,
+             "message": "time cap 5.0s exceeded at stage 'open' (12.3s) - dataset "
+                        "forces oversized reads"},
+        ])
+        for style in ("verdict", "score", "both"):
+            doc = rendering.render(findings, style)
+            self.assertIn("Budget / stage breaches", doc, f"style={style!r}")
+            self.assertIn("open", doc, f"style={style!r}")
+            self.assertIn("time cap 5.0s exceeded", doc, f"style={style!r}")
+
 
 class WriteReportTests(unittest.TestCase):
 

@@ -227,6 +227,32 @@ def orientation_section(asset: dict) -> str:
     return heading + "\n".join(lines)
 
 
+# --------------------------------------------------------- budget breaches
+
+def budget_breaches_section(asset: dict) -> str:
+    """S8: a stage that breached its byte/time cap (``telemetry.Budget.
+    check_stage``/``spend``, called with ``raise_on_breach=False`` by the
+    CLI orchestrator so the run continues to report) always leaves a
+    structured finding in ``Budget.breaches`` -- surfaced here so a
+    time/byte-capped, possibly-partial run is visible in every report
+    style (this section is unconditional in ``_body``, unlike the
+    smoke/compression/chunking sections below which are score/both-only)
+    rather than only in ``findings.json``.
+    """
+    heading = "## Budget / stage breaches\n\n"
+    breaches = asset.get("budget_breaches") or []
+    if not breaches:
+        return heading + "No budget breaches — every stage completed within its byte/time cap."
+    lines = ["This run hit its byte/time cap during one or more stages; results for "
+             "the affected stage(s) below may be partial/truncated.", "",
+             "| Stage | Detail |", "|---|---|"]
+    for b in breaches:
+        stage = b.get("stage") or "?"
+        detail = b.get("message") or f"{b.get('kind', 'time')} cap exceeded"
+        lines.append(f"| {stage} | {_md_escape(detail)} |")
+    return heading + "\n".join(lines)
+
+
 # -------------------------------------------------------------- smoke test
 
 def smoke_section(asset: dict) -> str:
@@ -377,6 +403,7 @@ def _body(findings: dict, asset: dict, style: str) -> str:
     if style in ("verdict", "both"):
         blocks.append("## Criteria\n\n" + criterion_table(asset))
     blocks.append(orientation_section(asset))
+    blocks.append(budget_breaches_section(asset))
     if style in ("score", "both"):
         blocks.append("## Per-asset findings\n\n" + per_asset(asset))
         blocks.append(smoke_section(asset))

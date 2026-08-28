@@ -121,6 +121,32 @@ class ZarrE2ETests(_TmpDirCase):
         # leak into the serialized findings.
         self.assertNotIn("handle", asset["open"])
 
+    def test_time_cap_breach_surfaces_as_a_finding_not_silently_absorbed(self):
+        """S8: Budget.check_stage always records a breach finding in
+        Budget.breaches; the CLI must surface it (in findings.json AND
+        the rendered report) rather than silently absorbing it just
+        because the run didn't crash. --time-cap 0 guarantees the
+        "open" stage's check_stage(..., raise_on_breach=False) call
+        breaches (elapsed monotonic time since Budget construction is
+        always > 0.0), without needing to fake the clock."""
+        store = _make_zarr_store(self.tmp)
+        out_dir = os.path.join(self.tmp, "out")
+
+        rc = cli.main([store, "--non-interactive", "--time-cap", "0", "--out", out_dir])
+
+        self.assertEqual(rc, 0)  # never crashes -- run still completes
+        findings = json.loads((Path(out_dir) / "findings.json").read_text())
+        asset = findings["assets"][0]
+        breaches = asset.get("budget_breaches") or []
+        self.assertGreater(len(breaches), 0)
+        self.assertTrue(any(b.get("stage") == "open" for b in breaches))
+        self.assertTrue(all(b.get("breached") for b in breaches))
+
+        report = (Path(out_dir) / "assessment-report.md").read_text()
+        self.assertIn("Budget / stage breaches", report)
+        self.assertIn("open", report)
+        self.assertNotIn("No budget breaches", report)
+
     def test_all_variables_selects_every_variable(self):
         store = _make_zarr_store(self.tmp)
         out_dir = os.path.join(self.tmp, "out")
