@@ -43,6 +43,8 @@ from typing import Any
 
 import numpy as np
 
+from . import telemetry
+
 __all__ = [
     "assess_chunking",
     "grade",
@@ -176,17 +178,23 @@ def is_data_bearing(decoded: "np.ndarray", fill_value=None, threshold: float = 0
     return frac_fill < threshold
 
 
-def _scan_interior(candidates, lookup_size, decode, fill_value, n):
+def _scan_interior(candidates, lookup_size, decode, fill_value, n, stop_exceptions=()):
     """Shared scan loop for zarr/HDF5 samplers: walk ``candidates``
     (chunk grid indices), skip ones with no stored size (unwritten/
     sparse), decode the rest and keep only data-bearing ones (S4) up to
-    ``n``. Returns ``(databearing_sizes, all_sizes_seen, tried)`` so the
-    caller can still report sizes (with ``data_bearing: false``) if
-    every candidate was fill.
+    ``n``. Returns ``(databearing_sizes, all_sizes_seen, tried, capped)``
+    so the caller can still report sizes (with ``data_bearing: false``)
+    if every candidate was fill.
+
+    ``stop_exceptions`` (e.g. ``(telemetry.BudgetExceeded,)``) are
+    treated as "stop sampling immediately, keep what was measured so
+    far" rather than "skip this one candidate and keep going" (the
+    default behavior for any other exception from ``decode``).
     """
     databearing_sizes = []
     all_sizes = []
     tried = 0
+    capped = False
     for idx in candidates:
         size = lookup_size(idx)
         if size is None:
@@ -194,6 +202,9 @@ def _scan_interior(candidates, lookup_size, decode, fill_value, n):
         tried += 1
         try:
             decoded = decode(idx)
+        except stop_exceptions:
+            capped = True
+            break
         except Exception:
             continue
         if size:
@@ -203,17 +214,25 @@ def _scan_interior(candidates, lookup_size, decode, fill_value, n):
                 databearing_sizes.append(size)
             if len(databearing_sizes) >= n:
                 break
-    return databearing_sizes, all_sizes[:n], tried
+    return databearing_sizes, all_sizes[:n], tried, capped
 
 
 _ALL_FILL_NOTE = ("all sampled chunks >=90% fill - compression/throughput telemetry "
                   "unreliable")
+_BUDGET_CAPPED_NOTE = ("sampling stopped: transfer budget byte cap reached while "
+                       "fetching interior candidate chunks - reporting sizes measured "
+                       "so far")
 
 
-def _finish_sample(databearing_sizes, all_sizes, tried):
+def _finish_sample(databearing_sizes, all_sizes, tried, capped=False):
     if databearing_sizes:
         return {"sizes": databearing_sizes, "measured": True,
-                "data_bearing": True, "note": None}
+                "data_bearing": True,
+                "note": _BUDGET_CAPPED_NOTE if capped else None}
+    if capped:
+        return {"sizes": all_sizes, "measured": bool(all_sizes),
+                "data_bearing": False if all_sizes else None,
+                "note": _BUDGET_CAPPED_NOTE}
     if tried == 0:
         return {"sizes": [], "measured": False, "data_bearing": None,
                 "note": "no stored chunks found near interior candidates"}
@@ -240,21 +259,46 @@ def _parse_zarr_chunk_key(rel: str):
         return None
 
 
-def _sample_zarr_chunk_sizes(arr, fs, array_path, n):
+def _sample_zarr_chunk_sizes(arr, fs, array_path, n, budget=None):
+    """S4 sampling for zarr. When ``budget`` is given, the listing call
+    (``fs.find``) and each candidate's raw stored-chunk fetch
+    (``cat_file``) are routed through a counting ``telemetry.CountingFS``
+    wrapper around ``fs`` (reusing ``fs`` as-is if it is already one, to
+    avoid double-wrapping/double-counting) so this I/O is genuinely
+    budget-tracked and the byte cap is enforced against real transfer
+    sizes -- this sampler previously listed/read through the raw ``fs``
+    with zero budget visibility, which is unsafe for a badly-chunked
+    remote dataset (exactly the case this tool exists to flag).
+
+    Without a ``budget`` (back-compat for direct callers/tests that
+    don't pass one), the raw ``fs`` is used uncounted, as before.
+    """
     shape = tuple(arr.shape)
     chunks = tuple(getattr(arr, "chunks", ()) or ())
     if not chunks or not shape:
         return {"sizes": [], "measured": False, "data_bearing": None,
                 "note": "no chunk grid (scalar or unchunked array)"}
 
+    if isinstance(fs, telemetry.CountingFS):
+        cfs = fs
+    elif budget is not None:
+        cfs = telemetry.counting_fs(fs, budget)
+    else:
+        cfs = None
+    list_fs = cfs if cfs is not None else fs
+
     prefix = array_path.rstrip("/") + "/"
     try:
-        listed = fs.find(prefix, detail=True)
+        listed = list_fs.find(prefix, detail=True)
+    except telemetry.BudgetExceeded as e:
+        return {"sizes": [], "measured": False, "data_bearing": None,
+                "note": f"{_BUDGET_CAPPED_NOTE} (during listing): {e}"}
     except Exception as e:
         return {"sizes": [], "measured": False, "data_bearing": None,
                 "note": f"could not list stored chunks: {type(e).__name__}: {e}"}
 
     key_to_size: dict[tuple, int | None] = {}
+    key_to_keystr: dict[tuple, str] = {}
     for key, info in listed.items():
         base = key.rsplit("/", 1)[-1]
         if base in _ZARR_META_BASENAMES:
@@ -263,6 +307,7 @@ def _sample_zarr_chunk_sizes(arr, fs, array_path, n):
         idx = _parse_zarr_chunk_key(rel)
         if idx is not None:
             key_to_size[idx] = info.get("size")
+            key_to_keystr[idx] = key
 
     fill_value = getattr(arr, "fill_value", None)
     candidates = pick_interior_chunks(shape, chunks, max(n, 1) * 4)
@@ -271,13 +316,24 @@ def _sample_zarr_chunk_sizes(arr, fs, array_path, n):
         return key_to_size.get(idx)
 
     def decode(idx):
+        if cfs is not None:
+            full_key = key_to_keystr.get(idx)
+            if full_key is not None:
+                # Fetch the real stored bytes through the counting
+                # wrapper first: this is what actually enforces the
+                # byte cap against genuine transfer size, before the
+                # (redundant, but now bounded-after-the-fact) decode
+                # below pulls the same chunk again through the zarr
+                # Array's own (uncounted) store.
+                cfs.cat_file(full_key)
         slices = tuple(slice(i * c, min(s, (i + 1) * c))
                         for i, c, s in zip(idx, chunks, shape))
         return np.asarray(arr[slices])
 
-    databearing, allsizes, tried = _scan_interior(candidates, lookup_size, decode,
-                                                   fill_value, n)
-    return _finish_sample(databearing, allsizes, tried)
+    databearing, allsizes, tried, capped = _scan_interior(
+        candidates, lookup_size, decode, fill_value, n,
+        stop_exceptions=(telemetry.BudgetExceeded,))
+    return _finish_sample(databearing, allsizes, tried, capped)
 
 
 # ------------------------------------------------------------ hdf5 chunk info
@@ -309,12 +365,12 @@ def _sample_hdf5_chunk_sizes(dataset, n):
         slices = tuple(slice(s, min(sh, s + c)) for s, c, sh in zip(start, chunks, shape))
         return np.asarray(dataset[slices])
 
-    databearing, allsizes, tried = _scan_interior(candidates, lookup_size, decode,
-                                                   fill_value, n)
-    return _finish_sample(databearing, allsizes, tried)
+    databearing, allsizes, tried, capped = _scan_interior(candidates, lookup_size, decode,
+                                                           fill_value, n)
+    return _finish_sample(databearing, allsizes, tried, capped)
 
 
-def sample_chunk_sizes(handle_or_dsid, fs, path, *, engine, n=8) -> dict:
+def sample_chunk_sizes(handle_or_dsid, fs, path, *, engine, n=8, budget=None) -> dict:
     """Measured stored (compressed) chunk sizes, sampled interior +
     data-bearing (S4). ``handle_or_dsid`` is the zarr Array or h5py
     Dataset object for the variable being sampled; for zarr, ``path``
@@ -323,6 +379,16 @@ def sample_chunk_sizes(handle_or_dsid, fs, path, *, engine, n=8) -> dict:
     listed via ``fs.find``; for HDF5, ``fs``/``path`` are unused (chunk
     info comes from the dataset's own ``.id``).
 
+    ``budget`` (optional): when given, zarr's listing (``fs.find``) and
+    per-candidate stored-chunk fetch (``cat_file``) are routed through a
+    ``telemetry.counting_fs`` wrapper around ``fs`` so this network I/O
+    is budget-tracked and the byte cap is genuinely enforced (see
+    ``_sample_zarr_chunk_sizes``); if the cap is hit mid-sample, sampling
+    stops and whatever was measured so far is returned with a note,
+    rather than raising out of this function. Unused for HDF5 (no
+    network I/O there -- chunk info/data come from the already-open
+    local file handle).
+
     Returns ``{"sizes": [int, ...], "measured": bool,
     "data_bearing": bool|None, "note": str|None}``. ``measured`` is
     True whenever real stored sizes were found (even if none were
@@ -330,7 +396,7 @@ def sample_chunk_sizes(handle_or_dsid, fs, path, *, engine, n=8) -> dict:
     stored chunks could be found/listed at all.
     """
     if engine in ("zarr", "icechunk"):
-        return _sample_zarr_chunk_sizes(handle_or_dsid, fs, path, n)
+        return _sample_zarr_chunk_sizes(handle_or_dsid, fs, path, n, budget=budget)
     if engine in ("hdf5", "netcdf4", "h5", "h5py"):
         return _sample_hdf5_chunk_sizes(handle_or_dsid, n)
     return {"sizes": [], "measured": False, "data_bearing": None,
@@ -356,12 +422,13 @@ _MUCH_LESS_FACTOR = 0.1  # f_time <= this * f_spatial_min counts as "time-thin"
 _AMP_WARN = 10.0
 _AMP_FAIL = 100.0
 
-# declare_orientation doesn't receive a dtype (see its signature in the task
-# brief), so "bytes needed" for its canonical queries uses this placeholder
-# itemsize (float64-equivalent) rather than a real per-variable dtype. This
-# only affects the amplification estimate's absolute scale, not its
-# direction; assess_chunking's own compressed_chunk_mb measurement (which
-# does know the real dtype) is what's actually graded via grade().
+# declare_orientation's public signature (per the task brief) doesn't
+# require a dtype, so "bytes needed" for its canonical queries falls back
+# to this placeholder itemsize (float64-equivalent) when the caller
+# doesn't supply the variable's real one via the ``itemsize`` keyword.
+# assess_chunking always has the real dtype for the variable it's
+# assessing and threads its itemsize through; only a caller invoking
+# declare_orientation directly without ``itemsize`` gets this fallback.
 _PLACEHOLDER_ITEMSIZE_BYTES = 8
 
 
@@ -415,13 +482,25 @@ def _query(chunks_touched, avg_chunk_mb, needed_bytes, use_case_target, use_case
 
 def declare_orientation(dims: list[str], shape: list[int], chunks: list[int], *,
                          avg_chunk_mb: float | None = None,
-                         use_case: str | None = None) -> dict:
+                         use_case: str | None = None,
+                         itemsize: int = _PLACEHOLDER_ITEMSIZE_BYTES) -> dict:
     """Classify what this chunk layout is optimized for and compute the
     two canonical queries (full spatial extent at one time; full-depth
     series at one point). ``avg_chunk_mb`` (compressed, if known) feeds
     the amplification estimate; without it, amplification is computed
     against a 1 MB per-chunk placeholder (still comparable in shape,
     documented as such via ``bytes_transferred_estimate``).
+
+    ``itemsize`` (bytes per element, keyword-only, additive beyond the
+    task brief's 3-positional-arg signature): feeds the "bytes needed"
+    baseline for the amplification queries. Defaults to
+    ``_PLACEHOLDER_ITEMSIZE_BYTES`` (8, float64-equivalent) so the
+    existing 3-positional-arg call form is unaffected; callers that know
+    the variable's real dtype (``assess_chunking`` does) should pass its
+    itemsize so the amplification estimate's absolute scale reflects the
+    real dtype instead of an 8-byte placeholder (narrow dtypes like
+    int16 can otherwise be off by ~4x, which can flip the warn/fail
+    grade).
 
     ``use_case`` (``"timeseries"|"maps"|None``) gates whether the
     relevant query's amplification is *graded* (warn >10x, fail >100x);
@@ -446,7 +525,7 @@ def declare_orientation(dims: list[str], shape: list[int], chunks: list[int], *,
         cy_cx = "x".join(str(chunks[i]) for i in spatial_idx) if spatial_idx else "?"
         prose = (f"{hedge_prefix}chunks are tiled {cy_cx} - efficient windowed spatial "
                  f"reads; full-scene reads touch {n_total} chunks")
-        needed_bytes = math.prod(shape) * _PLACEHOLDER_ITEMSIZE_BYTES if shape else None
+        needed_bytes = math.prod(shape) * itemsize if shape else None
         query = {
             "chunks_touched": n_total,
             "bytes_transferred_estimate": round(n_total * itemsize_mb * 2**20, 1),
@@ -475,8 +554,8 @@ def declare_orientation(dims: list[str], shape: list[int], chunks: list[int], *,
     map_chunks_touched = math.prod(math.ceil(shape[i] / chunks[i]) for i in spatial_idx)
     series_chunks_touched = math.ceil(shape[time_idx] / chunks[time_idx])
 
-    map_needed_bytes = math.prod(shape[i] for i in spatial_idx) * _PLACEHOLDER_ITEMSIZE_BYTES
-    series_needed_bytes = shape[time_idx] * _PLACEHOLDER_ITEMSIZE_BYTES
+    map_needed_bytes = math.prod(shape[i] for i in spatial_idx) * itemsize
+    series_needed_bytes = shape[time_idx] * itemsize
 
     queries = {
         "map_full_extent_one_time": _query(
@@ -558,7 +637,7 @@ def _build_profiles(compressed_mb):
         if profile == "training":
             entry["sweet_spot_mb"] = [32.0, 64.0]
         if profile == "agentic":
-            entry["note"] = "schema must additionally be enumerable in <=1 request"
+            entry["note"] = "schema must additionally be enumerable in <=3 requests"
         profiles[profile] = entry
     return profiles
 
@@ -599,13 +678,20 @@ def assess_chunking(handle, fs, path, variables: list[dict], *, budget,
         dtype = rec.get("dtype", "float64")
         codec = rec.get("codec")
         notes: list[str] = []
+        itemsize = _itemsize(dtype)
 
         if not chunks:
             notes.append(_contiguous_note(codec))
             compressed_mb = _estimate_compressed_mb(shape, dtype) if shape else None
             compressed_info = {"estimated_median": compressed_mb, "ratio_assumed": _ASSUMED_RATIO}
             measured = False
-            orientation = None
+            # Contiguous/unchunked variables still get a declare_orientation-
+            # shaped dict (not None) so every consumer can uniformly index
+            # orientation["queries"]/["prose"] -- declare_orientation
+            # already handles an empty chunks list gracefully, returning
+            # the "unknown" shape.
+            orientation = declare_orientation(dims, shape, [], use_case=use_case,
+                                               itemsize=itemsize)
         else:
             measured = False
             compressed_info = None
@@ -613,7 +699,8 @@ def assess_chunking(handle, fs, path, variables: list[dict], *, budget,
             try:
                 obj = _lookup_handle(handle, name, engine)
                 array_path = f"{str(path).rstrip('/')}/{name.lstrip('/')}"
-                sample = sample_chunk_sizes(obj, fs, array_path, engine=engine, n=8)
+                sample = sample_chunk_sizes(obj, fs, array_path, engine=engine, n=8,
+                                             budget=budget)
             except Exception as e:
                 notes.append(f"chunk sampling failed: {type(e).__name__}: {e}")
 
@@ -631,7 +718,7 @@ def assess_chunking(handle, fs, path, variables: list[dict], *, budget,
             avg_mb = (compressed_info.get("median") if measured
                       else compressed_info.get("estimated_median"))
             orientation = declare_orientation(dims, shape, chunks, avg_chunk_mb=avg_mb,
-                                               use_case=use_case)
+                                               use_case=use_case, itemsize=itemsize)
 
         avg_mb = (compressed_info.get("median") if measured
                   else compressed_info.get("estimated_median")) if compressed_info else None

@@ -269,7 +269,7 @@ class CountingFS:
     """
 
     _COUNTED = {"cat_file", "cat", "cat_ranges", "info", "ls", "exists",
-                "isdir", "isfile", "open", "get_mapper", "size"}
+                "isdir", "isfile", "open", "get_mapper", "size", "find"}
 
     def __init__(self, fs, budget: "Budget | None" = None):
         self._fs = fs

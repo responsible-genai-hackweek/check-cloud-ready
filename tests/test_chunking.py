@@ -187,6 +187,38 @@ class DeclareOrientationTests(unittest.TestCase):
         grade_val = graded["queries"]["map_full_extent_one_time"]["grade"]
         self.assertIn(grade_val, ("warn", "fail"))
 
+    def test_itemsize_scales_bytes_needed_and_amplification(self):
+        # Finding 3: the amplification query's "bytes needed" baseline
+        # must scale with the real per-variable itemsize, not stay
+        # pinned to the 8-byte placeholder.
+        dims, shape, chunks = ["time", "y", "x"], [8760, 720, 1440], [1, 720, 1440]
+        out_default = declare_orientation(dims, shape, chunks)
+        out_int16 = declare_orientation(dims, shape, chunks, itemsize=2)
+        out_float64 = declare_orientation(dims, shape, chunks, itemsize=8)
+
+        q_default = out_default["queries"]["timeseries_full_depth_one_point"]
+        q_int16 = out_int16["queries"]["timeseries_full_depth_one_point"]
+        q_float64 = out_float64["queries"]["timeseries_full_depth_one_point"]
+
+        # default (no itemsize given) matches the explicit 8-byte case
+        self.assertEqual(q_default["bytes_needed_estimate"], q_float64["bytes_needed_estimate"])
+        # bytes needed scales linearly with itemsize (2 vs 8 bytes -> 4x)
+        self.assertAlmostEqual(
+            q_float64["bytes_needed_estimate"] / q_int16["bytes_needed_estimate"], 4.0, places=3)
+        # amplification (bytes_transferred / bytes_needed) scales inversely,
+        # so the narrower dtype reports a *larger* amplification for the
+        # same transferred bytes -- this is exactly the "can flip the grade"
+        # effect the finding describes.
+        self.assertGreater(q_int16["amplification"], q_float64["amplification"])
+        self.assertAlmostEqual(
+            q_int16["amplification"] / q_float64["amplification"], 4.0, places=2)
+
+    def test_itemsize_default_preserves_three_positional_arg_call(self):
+        # The 3-positional-arg call form (no itemsize/use_case/avg_chunk_mb)
+        # must keep working unchanged.
+        out = declare_orientation(["y", "x"], [10980, 10980], [512, 512])
+        self.assertEqual(out["orientation"], "tiled")
+
 
 # ------------------------------------------------------------- sample_chunk_sizes
 
@@ -225,6 +257,45 @@ class SampleChunkSizesZarrTests(unittest.TestCase):
             out = sample_chunk_sizes(arr, fs, array_path, engine="zarr", n=8)
             self.assertFalse(out["data_bearing"])
             self.assertIn("fill", out["note"].lower())
+
+    def test_budget_cap_stops_sampling_gracefully(self):
+        # Finding 4: S4 zarr sampling I/O must be budget-bounded. A tiny
+        # byte_cap (smaller than a single stored interior chunk) should
+        # make sampling stop after the first candidate fetch, rather than
+        # reading unboundedly, and must not let BudgetExceeded escape.
+        with tempfile.TemporaryDirectory() as tmp:
+            arr, fs, array_path = self._make_store(tmp, all_fill=False)
+            tiny_budget = Budget(byte_cap=50)
+
+            out = sample_chunk_sizes(
+                arr, fs, array_path, engine="zarr", n=8, budget=tiny_budget)
+
+            # Graceful degradation: a note is present, no exception escaped
+            # (the call above would have raised if it had), and sampling
+            # did not proceed to read the whole store.
+            self.assertIsNotNone(out["note"])
+            self.assertIn("budget", out["note"].lower())
+            # Real bytes were counted up to the point sampling stopped --
+            # not zero (a measurement bug) and not unbounded (the whole
+            # store, which is far larger than the 50-byte cap).
+            self.assertGreater(tiny_budget.bytes, 0)
+            self.assertLess(tiny_budget.bytes, 40 * 40 * 4)  # << full uncompressed array
+
+    def test_generous_budget_does_not_cap_sampling(self):
+        # Sanity check: a budget with ample headroom still measures
+        # normally (the counting wrapper doesn't itself break sampling).
+        with tempfile.TemporaryDirectory() as tmp:
+            arr, fs, array_path = self._make_store(tmp, all_fill=False)
+            roomy_budget = Budget(byte_cap=25 * 1024 * 1024)
+
+            out = sample_chunk_sizes(
+                arr, fs, array_path, engine="zarr", n=8, budget=roomy_budget)
+
+            self.assertTrue(out["measured"])
+            self.assertTrue(out["data_bearing"])
+            self.assertTrue(len(out["sizes"]) > 0)
+            self.assertGreater(roomy_budget.bytes, 0)
+            self.assertGreater(roomy_budget.requests, 0)
 
 
 @unittest.skipUnless(h5py, "h5py not installed")
@@ -316,6 +387,69 @@ class AssessChunkingHDF5Tests(unittest.TestCase):
             self.assertFalse(var0["measured"])
             self.assertTrue(
                 any("contiguous" in n.lower() for n in var0["coordinate_chunking_notes"]))
+            result["handle"].close()
+
+    def test_contiguous_variable_orientation_is_declare_orientation_shaped(self):
+        # Finding 1: a contiguous (unchunked) variable must get a real
+        # declare_orientation-shaped dict, not None -- otherwise any
+        # consumer indexing variable["orientation"]["queries"]/["prose"]
+        # would crash.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.h5")
+            with h5py.File(path, "w") as f:
+                f.create_dataset("contig", data=np.zeros((100, 100), dtype="f4"))
+                f.create_dataset(
+                    "chunked", shape=(100, 100), chunks=(20, 20),
+                    dtype="f4", compression="gzip")
+                f["chunked"][:] = np.random.default_rng(3).random((100, 100)).astype("f4")
+            result, budget = self._open(path)
+            variables = [dict(v, dims=["y", "x"]) for v in result["inventory"]]
+            out = assess_chunking(
+                result["handle"], None, path, variables, budget=budget,
+                use_case=None, engine="hdf5")
+            by_name = {v["name"]: v for v in out["variables"]}
+            contig_orientation = by_name["/contig"]["orientation"]
+            chunked_orientation = by_name["/chunked"]["orientation"]
+
+            self.assertIsNotNone(contig_orientation)
+            self.assertEqual(set(contig_orientation.keys()), set(chunked_orientation.keys()))
+            self.assertIn("orientation", contig_orientation)
+            self.assertIn("prose", contig_orientation)
+            self.assertIn("queries", contig_orientation)
+            # Must not crash on the documented access patterns.
+            self.assertIsInstance(contig_orientation["queries"], dict)
+            self.assertIsInstance(contig_orientation["prose"], str)
+            result["handle"].close()
+
+
+# --------------------------------------------------------------- profiles
+
+class AgenticProfileNoteTests(unittest.TestCase):
+    def test_agentic_note_via_assess_chunking(self):
+        # Finding 2: the brief (task-7-brief.md line 13) says "<=3-requests
+        # -to-schema"; the profile note must say 3, not 1 (transcription
+        # error) -- exercised end-to-end via assess_chunking, which is
+        # where the profile overlay is actually built.
+        with tempfile.TemporaryDirectory() as tmp:
+            if h5py is None:
+                self.skipTest("h5py not installed")
+            path = os.path.join(tmp, "t.h5")
+            with h5py.File(path, "w") as f:
+                d = f.create_dataset(
+                    "x", shape=(40, 40), chunks=(10, 10), dtype="f4",
+                    compression="gzip",
+                )
+                d[:] = np.random.default_rng(4).random((40, 40)).astype("f4")
+            from check_cloud_ready import openers
+            budget = Budget()
+            result = openers.open_dataset("hdf5", None, path, budget)
+            variables = [dict(v, dims=["y", "x"]) for v in result["inventory"]]
+            out = assess_chunking(
+                result["handle"], None, path, variables, budget=budget,
+                use_case=None, engine="hdf5")
+            note = out["variables"][0]["profiles"]["agentic"]["note"]
+            self.assertIn("<=3 requests", note)
+            self.assertNotIn("<=1 request", note)
             result["handle"].close()
 
 
