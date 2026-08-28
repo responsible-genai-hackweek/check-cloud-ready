@@ -107,13 +107,16 @@ manual guidance today, not something this CLI measures per row group yet.
 
 ## Not yet supported by this CLI
 
-**Cloud-optimizable but not yet a supported opener**: COPC, GRIB2, FlatGeobuf,
-PMTiles. Say so, run only the hosting/access checks, and point at
-guide.cloudnativegeo.org for format-specific guidance.
+**Cloud-native but not yet a supported opener**: COPC, FlatGeobuf, PMTiles. These
+are cloud-native by format class (`formats.CLOUD_NATIVE`) — the layout itself is
+fine — this CLI simply has no opener for them yet. Say so, run only the
+hosting/access checks, and point at guide.cloudnativegeo.org for format-specific
+guidance in the meantime.
 
 **Cloud-hostile** (netcdf3, grib2, shapefile, csv, zip, tar, gzip, hdf4): always
-assessable, always low — see `references/legacy.md` for the mandatory migration
-commands per format.
+assessable, always low — this is a format-class judgment, not a missing-opener gap
+(none of these would score well even with a full opener). See `references/legacy.md`
+for the mandatory migration commands per format.
 
 STAC catalogs, STAC API search, and Croissant/GeoCroissant descriptor resolution are
 explicitly **out of scope** for this CLI: it assesses one asset entrypoint (a path,
