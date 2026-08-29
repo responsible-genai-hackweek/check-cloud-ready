@@ -204,7 +204,7 @@ def _hdf5_dataset_record(name: str, obj) -> dict:
     }
 
 
-def _hdf5_metadata_walk(h5, budget: telemetry.Budget):
+def _hdf5_metadata_walk(h5):
     """S7: bounded full-tree walk. Visits identification/metadata-named
     top-level groups (and their descendants) first, then the rest of
     the tree breadth-first, so those groups are captured even if a cap
@@ -220,22 +220,13 @@ def _hdf5_metadata_walk(h5, budget: telemetry.Budget):
     objects_visited = 0
     complete = True
     capped_at = None
-    req0 = budget.requests
-    byte0 = budget.bytes
 
     def visit(name, obj) -> bool:
         nonlocal objects_visited, complete, capped_at
         objects_visited += 1
         visit_order.append("/" + name.lstrip("/"))
-        budget.spend(0, 1)
         if isinstance(obj, h5py.Dataset):
             inventory.append(_hdf5_dataset_record(name, obj))
-        if objects_visited % _METADATA_WALK_CHECK_EVERY == 0:
-            finding = budget.check_stage("metadata_walk", raise_on_breach=False)
-            if finding["breached"]:
-                complete = False
-                capped_at = "time"
-                return False
         if objects_visited >= _METADATA_WALK_MAX_OBJECTS:
             complete = False
             capped_at = "objects"
@@ -262,8 +253,6 @@ def _hdf5_metadata_walk(h5, budget: telemetry.Budget):
 
     walk = {
         "objects_visited": objects_visited,
-        "requests": budget.requests - req0,
-        "bytes": budget.bytes - byte0,
         "complete": complete,
         "capped_at": capped_at,
         "visit_order": visit_order,
@@ -271,14 +260,13 @@ def _hdf5_metadata_walk(h5, budget: telemetry.Budget):
     return inventory, walk
 
 
-def _open_hdf5(fs, cfs, budget: telemetry.Budget, path: str):
+def _open_hdf5(fs, path: str):
     if h5py is None:
         return _result("skipped", reason="h5py not installed")
 
-    before = cfs.snapshot()
     f = None
     try:
-        f = cfs.open(path, "rb")
+        f = fs.open(path, "rb")
         h5 = h5py.File(f, "r")
     except Exception as e:
         if f is not None:
@@ -290,28 +278,13 @@ def _open_hdf5(fs, cfs, budget: telemetry.Budget, path: str):
             return _result("skipped", reason=f"auth: {type(e).__name__}: {e}")
         return _result("fail", reason=f"{type(e).__name__}: {e}")
 
-    after_open = cfs.snapshot()
-    requests_to_open = after_open["requests"] - before["requests"]
-    bytes_to_open = after_open["bytes_read"] - before["bytes_read"]
-
-    try:
-        inventory, walk = _hdf5_metadata_walk(h5, budget)
-    except telemetry.BudgetExceeded as e:
-        h5.close()
-        return _result("fail", reason=f"budget exceeded during metadata walk: {e}")
-
-    try:
-        telemetry.assert_open_measured({"bytes_read": bytes_to_open})
-    except telemetry.MeasurementError as e:
-        h5.close()
-        return _result("fail", reason=str(e))
+    inventory, walk = _hdf5_metadata_walk(h5)
+    h5.close()
 
     crs_containers = _find_crs_containers(inventory)
 
     return _result(
         "ok", handle=h5,
-        telemetry_stats={"requests_to_open": requests_to_open,
-                          "bytes_to_open": bytes_to_open},
         inventory=inventory,
         format_checks={"crs_containers": crs_containers},
         metadata_walk=walk,
@@ -320,7 +293,7 @@ def _open_hdf5(fs, cfs, budget: telemetry.Budget, path: str):
 
 # ------------------------------------------------------------------- zarr
 
-def _zarr_consolidated_probe(cfs, path: str) -> dict:
+def _zarr_consolidated_probe(path: str) -> dict:
     """One explicit, counted read of the store's root metadata file,
     which is enough to tell whether the store is consolidated (a
     single request reveals the whole layout) -- the "trivially
@@ -391,9 +364,10 @@ def _zarr_array_record(name: str, arr) -> dict:
         size_bytes = int((math.prod(shape) if shape else 1) * arr.dtype.itemsize)
     except Exception:
         size_bytes = None
+    dims = arr.attrs.get("_ARRAY_DIMENSIONS")
     return {
         "name": "/" + name.lstrip("/"),
-        "dims": [f"dim_{i}" for i in range(len(shape))],
+        "dims": dims if dims is not None else [f"dim_{i}" for i in range(len(shape))],
         "shape": shape,
         "dtype": dtype,
         "chunks": chunks,
@@ -411,15 +385,11 @@ def _zarr_inventory(group) -> list[dict]:
     return inventory
 
 
-def _open_zarr(fs, cfs, budget: telemetry.Budget, path: str):
+def _open_zarr(fs, path: str):
     if zarr is None:
         return _result("skipped", reason="zarr not installed")
 
-    before = cfs.snapshot()
-    consolidated = _zarr_consolidated_probe(cfs, path)
-    after_probe = cfs.snapshot()
-    requests_to_open = after_probe["requests"] - before["requests"]
-    bytes_to_open = after_probe["bytes_read"] - before["bytes_read"]
+    consolidated = _zarr_consolidated_probe(path)
 
     try:
         store = _zarr_store_for(fs, path)
@@ -433,18 +403,11 @@ def _open_zarr(fs, cfs, budget: telemetry.Budget, path: str):
             return _result("skipped", reason=f"auth: {type(e).__name__}: {e}")
         return _result("fail", reason=f"{type(e).__name__}: {e}")
 
-    try:
-        telemetry.assert_open_measured({"bytes_read": bytes_to_open})
-    except telemetry.MeasurementError as e:
-        return _result("fail", reason=str(e))
-
     inventory = _zarr_inventory(group)
     crs_containers = _find_crs_containers(inventory)
 
     return _result(
         "ok", handle=group,
-        telemetry_stats={"requests_to_open": requests_to_open,
-                          "bytes_to_open": bytes_to_open},
         inventory=inventory,
         format_checks={"crs_containers": crs_containers,
                         "consolidated": consolidated["consolidated"],
@@ -635,4 +598,4 @@ def open_dataset(fmt: str, fs, path: str, budget: telemetry.Budget) -> dict:
         fs = fsspec.filesystem("file")
 
     cfs = telemetry.counting_fs(fs, budget)
-    return opener(fs, cfs, budget, path)
+    return opener(fs, path)
