@@ -1,3 +1,5 @@
+⚠️ Prototype heavily produced by AI, not ready for general use ⚠️
+
 # check-cloud-ready
 
 A deterministic CLI that assesses whether an Earth-systems dataset is **cloud
